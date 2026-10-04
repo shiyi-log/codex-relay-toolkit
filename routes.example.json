@@ -1,0 +1,49 @@
+# Example route table for bridge.py.
+#
+# setup.py generates the real one from CC Switch's database. Never commit the
+# generated file: it contains each relay's API key in the "auth" field.
+#
+#   mount    path prefix the bridge listens on (CC Switch's provider base_url
+#            points at  http://127.0.0.1:<port><mount><prefix>)
+#   prefix   path suffix of the relay's real base_url ("" or "/v1"/...)
+#   upstream scheme://host of the relay
+#   auth     the relay's API key  -> keep secret
+#   max_attempts  optional per-route attempt cap (used for the fallback account)
+#   auth_type     "bearer" (default) or "oauth" (Codex auth.json, ChatGPT login)
+{
+  "port": 15888,
+  "attempts": 100,
+  "order": [
+    "11111111-1111-1111-1111-111111111111",
+    "22222222-2222-2222-2222-222222222222",
+    "33333333-3333-3333-3333-333333333333"
+  ],
+  "routes": {
+    "11111111-1111-1111-1111-111111111111": {
+      "mount": "/p/11111111-1111-1111-1111-111111111111",
+      "prefix": "/v1",
+      "upstream": "https://relay-a.example",
+      "name": "relay-a",
+      "auth": "sk-REPLACE_ME",
+      "original_base_url": "https://relay-a.example/v1"
+    },
+    "22222222-2222-2222-2222-222222222222": {
+      "mount": "/p/22222222-2222-2222-2222-222222222222",
+      "prefix": "",
+      "upstream": "https://relay-b.example",
+      "name": "relay-b",
+      "auth": "sk-REPLACE_ME",
+      "original_base_url": "https://relay-b.example"
+    },
+    "33333333-3333-3333-3333-333333333333": {
+      "mount": "/p/33333333-3333-3333-3333-333333333333",
+      "prefix": "",
+      "upstream": "https://chatgpt.com/backend-api/codex",
+      "name": "own ChatGPT account (fallback)",
+      "auth_type": "oauth",
+      "auth_file": "~/.codex/auth.json",
+      "max_attempts": 10,
+      "original_base_url": "https://chatgpt.com/backend-api/codex"
+    }
+  }
+}

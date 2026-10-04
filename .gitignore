@@ -1,0 +1,26 @@
+# generated at runtime — NEVER commit these
+routes.json
+originals.json
+state.json
+DISABLED
+
+# logs / test artefacts
+*.log
+*.out
+*.out.log
+fb*.json
+fr*.json
+rr*.json
+r_*.json
+routes*.json
+oauth_routes.json
+!routes.example.json
+
+# python
+__pycache__/
+*.py[cod]
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/

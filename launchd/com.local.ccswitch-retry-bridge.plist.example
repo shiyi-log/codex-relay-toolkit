@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copy to ~/Library/LaunchAgents/, replace __REPO__ with this checkout's path,
+     then: launchctl load -w ~/Library/LaunchAgents/<name>.plist          -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.local.ccswitch-retry-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__REPO__/bridge.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BRIDGE_PORT</key><string>15888</string>
+    <key>BRIDGE_ATTEMPTS</key><string>100</string>
+    <key>BRIDGE_MAX_SECONDS</key><string>600</string>
+    <key>BRIDGE_BACKOFF</key><string>0.15</string>
+    <key>BRIDGE_NET_BACKOFF_MAX</key><string>8</string>
+    <key>BRIDGE_FIRST_BYTE_TIMEOUT</key><string>50</string>
+    <key>BRIDGE_TIMEOUT</key><string>600</string>
+    <key>BRIDGE_BACKLOG</key><string>256</string>
+  </dict>
+  <!-- default launchd soft limit is 256 fds; a streaming proxy needs more -->
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>8192</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__REPO__/bridge.out.log</string>
+  <key>StandardErrorPath</key><string>__REPO__/bridge.err.log</string>
+</dict>
+</plist>
