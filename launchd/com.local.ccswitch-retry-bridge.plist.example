@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Copy to ~/Library/LaunchAgents/, replace __REPO__ with this checkout's path,
-     then: launchctl load -w ~/Library/LaunchAgents/<name>.plist          -->
+<!-- 用法：复制到 ~/Library/LaunchAgents/，把 __REPO__ 换成本仓库的实际路径，
+     然后执行 launchctl load -w ~/Library/LaunchAgents/<文件名>.plist        -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -23,7 +23,7 @@
     <key>BRIDGE_TIMEOUT</key><string>600</string>
     <key>BRIDGE_BACKLOG</key><string>256</string>
   </dict>
-  <!-- default launchd soft limit is 256 fds; a streaming proxy needs more -->
+  <!-- launchd 默认的文件描述符软上限只有 256，流式代理不够用 -->
   <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>8192</integer></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
