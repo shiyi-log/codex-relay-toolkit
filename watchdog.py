@@ -47,6 +47,7 @@ GOALS_DB = os.path.expanduser("~/.codex/goals_1.sqlite")
 IDLE_SECONDS = 120          # rollout must be quiet this long
 COOLDOWN_SECONDS = 600      # between two resumes of the same thread
 MAX_PER_HOUR = 3            # per thread
+MAX_CONSECUTIVE_FAILS = 3   # stop retrying a thread the app-server keeps rejecting
 LOOKBACK_HOURS = 12         # only threads touched recently
 SKIP_GOAL_STATUS = {"paused", "complete", "blocked", "usage_limited", "budget_limited"}
 
@@ -153,6 +154,12 @@ def main():
         st = state.setdefault(tid, {"history": [], "last": 0})
         st["history"] = [t for t in st["history"] if now - t < 3600]
 
+        # a failed streak resets as soon as the session actually does something
+        if st.get("fails", 0) and os.path.getmtime(path) > st.get("last", 0):
+            st["fails"] = 0
+        if st.get("fails", 0) >= MAX_CONSECUTIVE_FAILS:
+            continue                                  # already gave up on this one
+
         if continued:
             continue                                  # Codex already resumed it
         idle = now - os.path.getmtime(path)
@@ -185,10 +192,19 @@ def main():
             ok = False
             log("RESUME %s FAILED: %s" % (tid[:8], exc))
 
+        # BUG FIX: this used to run only on success, so a resume that kept
+        # failing was retried every single cycle forever (152 attempts in 2.5h
+        # against a thread the app-server refuses to accept input for).
+        st["last"] = now                     # cooldown applies to ATTEMPTS
+        st["history"].append(now)            # hourly cap applies to ATTEMPTS
         if ok:
-            st["last"] = now
-            st["history"].append(now)
+            st["fails"] = 0
             actions += 1
+        else:
+            st["fails"] = st.get("fails", 0) + 1
+            if st["fails"] >= MAX_CONSECUTIVE_FAILS:
+                log("GIVEUP %s after %d failed resume attempts; leaving it alone "
+                    "until the session produces new activity" % (tid[:8], st["fails"]))
 
     save_state(state)
     if actions:

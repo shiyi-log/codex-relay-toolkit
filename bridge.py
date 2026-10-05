@@ -57,6 +57,10 @@ BACKOFF = float(os.environ.get("BRIDGE_BACKOFF", "0.15"))
 # so hammering the chain is pointless - backing off lets the request ride the
 # outage out instead of burning the whole budget inside it.
 NET_BACKOFF_MAX = float(os.environ.get("BRIDGE_NET_BACKOFF_MAX", "8"))
+# Abort the whole request once this many consecutive connection-level failures
+# have happened. Without it a total network outage keeps the request alive for
+# BRIDGE_MAX_SECONDS, so the client looks frozen instead of failing fast.
+NET_FAIL_LIMIT = int(os.environ.get("BRIDGE_NET_FAIL_LIMIT", "15"))
 READ_TIMEOUT = float(os.environ.get("BRIDGE_TIMEOUT", "300"))
 CONNECT_TIMEOUT = float(os.environ.get("BRIDGE_CONNECT_TIMEOUT", "20"))
 # How long to wait for the *first* byte of a stream. Kept below CC Switch's
@@ -500,6 +504,11 @@ class Handler(BaseHTTPRequestHandler):
             if MAX_SECONDS and (time.time() - start_time) >= MAX_SECONDS:
                 log("TIMEBOX %s %s stopped after %.0fs / %d attempt(s)"
                     % (method, split.path, time.time() - start_time, done))
+                break
+            if NET_FAIL_LIMIT and netfails >= NET_FAIL_LIMIT:
+                log("NETOUTAGE %s %s aborted after %d consecutive network failures "
+                    "in %.0fs - the network itself is down, not the relays"
+                    % (method, split.path, netfails, time.time() - start_time))
                 break
             if done < attempts:
                 if netfails:
