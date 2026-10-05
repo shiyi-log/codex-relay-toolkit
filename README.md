@@ -87,6 +87,7 @@ All via environment variables (see `launchd/*.plist.example`):
 | `BRIDGE_MAX_SECONDS` | `600` | wall-clock cap per request (`0` = off) |
 | `BRIDGE_BACKOFF` | `0.15` | base delay between HTTP-level retries |
 | `BRIDGE_NET_BACKOFF_MAX` | `8` | cap for connection-failure backoff |
+| `BRIDGE_NET_FAIL_LIMIT` | `15` | abort the request after this many consecutive connection failures (a total network outage should fail fast, not hang) |
 | `BRIDGE_FIRST_BYTE_TIMEOUT` | `50` | wait for the first byte before rotating |
 | `BRIDGE_TIMEOUT` | `600` | read timeout once a stream is running |
 | `BRIDGE_BACKLOG` | `256` | listen backlog (the stdlib default of 5 drops connections) |
