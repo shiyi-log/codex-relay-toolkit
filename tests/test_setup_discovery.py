@@ -27,6 +27,7 @@ SRC_ID = "11111111-1111-1111-1111-111111111111"
 COPY_ID = "22222222-2222-2222-2222-222222222222"
 DIRECT_ID = "33333333-3333-3333-3333-333333333333"
 BADCOPY_ID = "44444444-4444-4444-4444-444444444444"
+GHOST_ID = "55555555-5555-5555-5555-555555555555"   # deleted in CC Switch
 
 
 class MockRelay:
@@ -125,7 +126,9 @@ class DiscoveryTest(unittest.TestCase):
 
         with open(cls.originals, "w") as fh:
             # stale record: C has since been re-pointed in the CC Switch UI
-            json.dump({DIRECT_ID: "https://stale.example"}, fh)
+            # ghost record: E was deleted in the CC Switch UI altogether
+            json.dump({DIRECT_ID: "https://stale.example",
+                       GHOST_ID: "https://gone.example"}, fh)
 
         env = dict(os.environ, BRIDGE_DB=cls.db, BRIDGE_ROUTES=cls.routes,
                    BRIDGE_ORIGINALS=cls.originals, BRIDGE_OFFICIAL="0",
@@ -176,6 +179,13 @@ class DiscoveryTest(unittest.TestCase):
     def test_every_route_is_in_the_round_robin_order(self):
         for pid in (SRC_ID, COPY_ID, DIRECT_ID, BADCOPY_ID):
             self.assertIn(pid, self.written["order"])
+
+    def test_deleted_provider_is_pruned_from_originals(self):
+        with open(self.originals) as fh:
+            kept = json.load(fh)
+        self.assertNotIn(GHOST_ID, kept)              # gone from CC Switch
+        self.assertNotIn(GHOST_ID, self.written["routes"])
+        self.assertEqual(kept[DIRECT_ID], self.direct_relay.url)   # refreshed
 
 
 if __name__ == "__main__":

@@ -356,6 +356,16 @@ def main():
     conn.commit()
     conn.close()
 
+    # A provider deleted in the CC Switch UI must not linger here: it would stay
+    # in the "known upstream" memory, and restore.py would report it as missing.
+    live = {row[0] for row in rows}
+    dropped = [pid for pid in originals if pid not in live]
+    for pid in dropped:
+        originals.pop(pid, None)
+    if dropped:
+        print("  %s %d provider(s) deleted in CC Switch out of originals.json"
+              % ("[dry-run] would drop" if DRY_RUN else "dropped", len(dropped)))
+
     # round-robin order == CC Switch's failover priority, official account last
     order = [r[0] for r in rows if r[0] in new_routes] + official_pids
 

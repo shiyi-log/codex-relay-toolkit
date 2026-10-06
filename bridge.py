@@ -754,6 +754,21 @@ def load_state():
         % (len(_stats), len(_prices)))
 
 
+def prune_state():
+    """Forget relays that are no longer in routes.json (deleted in CC Switch)."""
+    with _state_lock:
+        live = set(_state["routes"])
+    if not live:
+        return
+    with _stats_lock:
+        removed = [pid for pid in _stats if pid not in live]
+        removed += [pid for pid in _prices if pid not in live]
+        for pid in set(removed):
+            _stats.pop(pid, None)
+            _prices.pop(pid, None)
+    return len(set(removed))
+
+
 def housekeeping():
     """Background price refresh + state save. Never touches request handling."""
     while True:
@@ -762,6 +777,7 @@ def housekeeping():
                 routes = dict(_state["routes"])
             if routes:
                 refresh_prices(routes)
+                prune_state()
             save_state()
         except Exception as exc:                                   # pragma: no cover
             log("housekeeping failed: %r" % exc)
