@@ -117,14 +117,32 @@ def log(msg):
         pass
 
 
-def log_request(mount, relay, model, attempt, status, seconds, result):
-    """Append one structured request line (see BRIDGE_REQUEST_LOG)."""
+def log_request(mount, relay, model, attempt, status, seconds, result,
+                pid=None, tokens=None):
+    """Append one structured request line (see BRIDGE_REQUEST_LOG).
+
+    `tokens` comes from the relay's own `usage` block; `est_cost_usd` prices it
+    with **that relay's measured $/weighted-M-token**, i.e. what this relay
+    really charges - not the shared blended table CC Switch uses.
+    """
     if not REQUEST_LOG:
         return
+    price = None
+    if pid and tokens:
+        price, _exact = price_index(pid, model)
     entry = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "epoch": round(time.time(), 3),
              "mount": mount, "relay": relay, "model": model, "attempt": attempt,
              "status": status, "result": result,
              "first_byte_ms": round(seconds * 1000) if seconds is not None else None}
+    if tokens:
+        entry["tokens"] = tokens
+        entry["price_per_m"] = round(price, 5) if price else None
+        entry["est_cost_usd"] = (round(weighted_tokens({
+            "input_tokens": tokens.get("input"),
+            "output_tokens": tokens.get("output"),
+            "cache_read_tokens": tokens.get("cache_read"),
+            "cache_creation_tokens": tokens.get("cache_creation")}) * price, 8)
+            if price else None)
     try:
         with _log_lock:
             if os.path.exists(REQUEST_LOG) and os.path.getsize(REQUEST_LOG) > 5 * 1024 * 1024:
@@ -133,6 +151,77 @@ def log_request(mount, relay, model, attempt, status, seconds, result):
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+class UsageScanner:
+    """Pull the `usage` block out of a streamed Responses API body.
+
+    The bridge relays streams chunk by chunk and must not buffer a whole
+    response, so this keeps only a bounded window and tries to decode the
+    object after every `"usage":` marker. The last usable block wins (relays
+    often send `"usage":{}` in earlier events and the real numbers in the final
+    `response.completed`).
+    """
+
+    MARKER = '"usage"'
+
+    def __init__(self, limit=256 * 1024):
+        self.buf = ""
+        self.limit = limit
+        self.usage = None
+
+    def feed(self, chunk):
+        if not chunk:
+            return
+        self.buf += chunk.decode("utf-8", "replace")
+        if len(self.buf) > self.limit:
+            self.buf = self.buf[-self.limit:]
+        while True:
+            i = self.buf.find(self.MARKER)
+            if i < 0:
+                self.buf = self.buf[-64:]      # marker may straddle two chunks
+                return
+            j = self.buf.find("{", i + len(self.MARKER))
+            if j < 0:
+                self.buf = self.buf[i:]
+                return
+            try:
+                obj, end = json.JSONDecoder().raw_decode(self.buf[j:])
+            except ValueError:
+                if len(self.buf) >= self.limit:
+                    self.buf = self.buf[j + 1:]   # malformed, stop retrying it
+                else:
+                    self.buf = self.buf[i:]       # truncated: wait for more
+                return
+            if isinstance(obj, dict) and obj:
+                self.usage = obj
+            self.buf = self.buf[j + end:]
+
+    def tokens(self):
+        return normalise_usage(self.usage)
+
+
+def normalise_usage(usage):
+    """Responses-API usage -> our token buckets.
+
+    `input_tokens` already includes the cached ones, so uncached input is the
+    difference; that matches how the relays' own `model_stats` count them.
+    """
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("input_tokens_details") or {}
+    try:
+        total_in = int(usage.get("input_tokens") or 0)
+        out = int(usage.get("output_tokens") or 0)
+        cached = int(details.get("cached_tokens") or 0)
+        written = int(details.get("cache_write_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (total_in or out or cached):
+        return None
+    return {"input": max(0, total_in - cached), "output": out,
+            "cache_read": cached, "cache_creation": written,
+            "total": int(usage.get("total_tokens") or (total_in + out))}
 
 
 # --------------------------------------------------------------------------- routes
@@ -973,7 +1062,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             log("CLIENT-GONE while sending %s: %s" % (status, exc))
 
-    def _stream(self, status, headers, resp, head=b""):
+    def _stream(self, status, headers, resp, head=b"", scanner=None):
         try:
             self.send_response(status)
             for key, value in headers:
@@ -984,11 +1073,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if head:
                 self.wfile.write(b"%x\r\n" % len(head) + head + b"\r\n")
+                if scanner:
+                    scanner.feed(head)
             while True:
                 chunk = resp.read(8192)
                 if not chunk:
                     break
                 self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                if scanner:
+                    scanner.feed(chunk)
             self.wfile.write(b"0\r\n\r\n")
         except OSError as exc:
             self.close_connection = True
@@ -1184,12 +1277,13 @@ class Handler(BaseHTTPRequestHandler):
                         # first byte is what "faster to call" really means here
                         ttfb = time.time() - attempt_started
                         record_attempt(pid, ttfb)
-                        log_request(mount_name, route["name"], wanted, done, status,
-                                    ttfb, "ok")
                         log("OK    %s %s -> %s via %s (attempt %d/%d) model=%s"
                             % (method, split.path, status, route["name"], done,
                                attempts, wanted or "?"))
-                        self._stream(status, raw_headers, resp, head)
+                        scanner = UsageScanner()
+                        self._stream(status, raw_headers, resp, head, scanner)
+                        log_request(mount_name, route["name"], wanted, done, status,
+                                    ttfb, "ok", pid=pid, tokens=scanner.tokens())
                         conn.close()
                         return
 
@@ -1201,11 +1295,17 @@ class Handler(BaseHTTPRequestHandler):
 
                 if not retryable:
                     seconds = None
+                    tokens = None
                     if status == 200:
                         seconds = time.time() - attempt_started
                         record_attempt(pid, seconds)
+                        try:
+                            tokens = normalise_usage(
+                                (json.loads(body.decode("utf-8")) or {}).get("usage"))
+                        except Exception:
+                            tokens = None
                     log_request(mount_name, route["name"], wanted, done, status,
-                                seconds, "pass")
+                                seconds, "pass", pid=pid, tokens=tokens)
                     log("PASS  %s %s -> %s via %s (attempt %d) model=%s"
                         % (method, split.path, status, route["name"], done,
                            wanted or "?"))

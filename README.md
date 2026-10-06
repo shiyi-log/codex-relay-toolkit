@@ -135,15 +135,25 @@ CC Switch 的请求日志只会记 **它把请求发给了谁**——也就是�
 
 ```bash
 tail -f ~/.ccswitch-retry-bridge/bridge-requests.jsonl
-{"ts":"2026-10-07 03:31:40","mount":"pp 特惠","relay":"pp 特惠","model":"gpt-6-sol",
- "attempt":1,"status":200,"result":"ok","first_byte_ms":3946}
+{"ts":"2026-10-07 04:49:41","mount":"pp 特惠","relay":"pp  plus","model":"gpt-6.1-sol",
+ "attempt":1,"status":200,"result":"ok","first_byte_ms":4435,
+ "tokens":{"input":1366,"output":96,"cache_read":168704,"cache_creation":0,"total":170166},
+ "price_per_m":0.03074,"est_cost_usd":0.000572}
 ```
 
 `mount` = CC Switch 发给了谁，`relay` = 桥实际用了谁，`attempt` = 第几次尝试，
-`result` = `ok`/`pass`/`retry`/`stalled`/`network-error`。文件到 5MB 自动轮转成 `.1`；
-`BRIDGE_REQUEST_LOG=0` 可关闭。`bridge.log` 的每行现在也带 `model=`。
+`result` = `ok`/`pass`/`retry`/`stalled`/`network-error`。
 
-**「主动动态调整」还是「失败重连」？** 用脚本一句话分清：
+**`tokens` 来自中转自己返回的 `usage`**（`input` 是**未缓存**输入，即 `input_tokens`
+减去 `input_tokens_details.cached_tokens`）；**`est_cost_usd` = 该请求的加权 token ×
+`price_per_m`**，而 `price_per_m` 是**这家自己的实测单价**（见上文，最近几天账单×趋势）。
+所以这个金额是"这次请求在这家中转上实际该花多少"，比 CC Switch 的混合单价更接近真相。
+流式响应里 usage 只在最后一个事件出现，桥用有界扫描（`UsageScanner`）解析，
+不缓存整个响应；截断的 usage 一律丢弃，不会记半截数字。
+
+文件到 5MB 自动轮转成 `.1`；`BRIDGE_REQUEST_LOG=0` 可关闭。`bridge.log` 的每行现在也带 `model=`。
+
+**「主动动态调整」还是「失败重连」？以及花了多少钱：**
 
 ```bash
 python3 request_stats.py                 # 默认读 ~/.ccswitch-retry-bridge
@@ -151,9 +161,17 @@ python3 request_stats.py --minutes 30
 ```
 
 ```
-① attempt=1 且 relay == mount  :   540  ( 58%)  入口那家就是第一名，没换
-② attempt=1 且 relay != mount  :   352  ( 38%)  ★主动切换：前面没有任何失败
-③ attempt >= 2                 :    45  (  5%)  失败重连（真正的 failover）
+① attempt=1 且 relay == mount  :  1448  ( 73%)  入口那家就是第一名，没换
+② attempt=1 且 relay != mount  :   504  ( 25%)  ★主动切换：前面没有任何失败
+③ attempt >= 2                 :    42  (  2%)  失败重连（真正的 failover）
+
+中转                          服务      主动      重连     首字节中位    加权M tok    估算花费$
+pp  plus                   415     391      24     4435ms      0.248      0.01273
+wdlink plus                 90      74      16     6070ms      0.000      0.00000
+
+用量与花费（有 usage 的 17/1994 个请求）
+  未缓存输入 19752   输出 4246   缓存读取 2111232   缓存命中率 99%
+  加权百万 token: 0.248   估算总花费: $0.01273
 ```
 
 **②才是"动态排序起作用"的证据**：请求在**第一次尝试**就发给了别家，不可能由失败触发。

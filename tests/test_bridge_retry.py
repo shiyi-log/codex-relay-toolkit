@@ -26,13 +26,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BRIDGE = os.path.join(ROOT, "bridge.py")
+sys.path.insert(0, ROOT)
+import bridge as bridge_mod                                   # noqa: E402
+
 MODEL = "gpt-6.1-sol"
 UPSTREAM_400 = (b'{"error":{"message":"Upstream request failed",'
                 b'"type":"upstream_error"}}')
+# a real-shaped stream: first byte early, usage only in the final event
 SSE = (b"event: response.output_text.delta\n"
        b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
        b"event: response.completed\n"
-       b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n')
+       b'data: {"type":"response.completed","response":{"status":"completed",'
+       b'"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":800},'
+       b'"output_tokens":10,"total_tokens":1010}}}\n\n')
 
 
 def free_port():
@@ -53,7 +59,17 @@ class FlakyRelay:
             protocol_version = "HTTP/1.1"
 
             def do_GET(self):
-                body = json.dumps({"data": [{"id": MODEL}]}).encode()
+                if self.path.endswith("/usage"):
+                    # actual_cost 0.5 for 1M input tokens -> $0.5 per weighted M
+                    body = json.dumps({
+                        "balance": 5, "remaining": 5, "unit": "USD",
+                        "model_stats": [{"model": MODEL, "input_tokens": 1_000_000,
+                                         "output_tokens": 0, "cache_read_tokens": 0,
+                                         "cache_creation_tokens": 0,
+                                         "total_tokens": 1_000_000,
+                                         "cost": 1.0, "actual_cost": 0.5}]}).encode()
+                else:
+                    body = json.dumps({"data": [{"id": MODEL}]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -127,6 +143,17 @@ class RetryLoopTest(unittest.TestCase):
         else:
             proc.kill()
             self.fail("bridge did not start")
+        # wait for the first price refresh so est_cost_usd can be computed
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                snap = json.loads(urllib.request.urlopen(
+                    "http://127.0.0.1:%d/__bridge/status" % port, timeout=2).read())
+                if any(r["price_per_m"] for r in snap["routes"]):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
         return proc, port, tmp
 
     def post(self, port):
@@ -157,6 +184,15 @@ class RetryLoopTest(unittest.TestCase):
             self.assertEqual(lines[-1]["model"], MODEL)
             self.assertEqual(lines[-1]["attempt"], 3)
             self.assertIsNotNone(lines[-1]["first_byte_ms"])
+            # tokens come from the relay's own usage block, cost from that
+            # relay's measured price (0.5 for 1M input -> $0.5/weighted-M)
+            self.assertEqual(lines[-1]["tokens"], {"input": 200, "output": 10,
+                                                   "cache_read": 800,
+                                                   "cache_creation": 0, "total": 1010})
+            self.assertAlmostEqual(lines[-1]["price_per_m"], 0.5, places=4)
+            self.assertAlmostEqual(lines[-1]["est_cost_usd"], 320e-6 * 0.5, places=8)
+            # retry lines carry no usage
+            self.assertNotIn("tokens", lines[0])
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -178,6 +214,46 @@ class RetryLoopTest(unittest.TestCase):
             proc.terminate()
             proc.wait(timeout=5)
             relay.stop()
+
+
+class UsageScannerTest(unittest.TestCase):
+    """The usage block only arrives at the end of a stream, in pieces."""
+
+    def test_truncated_usage_is_never_used(self):
+        s = bridge_mod.UsageScanner()
+        s.feed(b'{"type":"response.completed","response":{"usage":{"input_tokens":43')
+        self.assertIsNone(s.tokens())
+        s.feed(b'88,"output_tokens":5')
+        self.assertIsNone(s.tokens())
+        s.feed(b',"input_tokens_details":{"cached_tokens":3840},'
+               b'"total_tokens":4393}}}\n\n')
+        self.assertEqual(s.tokens(), {"input": 548, "output": 5, "cache_read": 3840,
+                                      "cache_creation": 0, "total": 4393})
+
+    def test_marker_split_across_chunks(self):
+        s = bridge_mod.UsageScanner()
+        s.feed(b'...{"usa')
+        s.feed(b'ge":{"input_tokens":100,"output_tokens":1,'
+               b'"input_tokens_details":{"cached_tokens":90}}}')
+        self.assertEqual(s.tokens()["cache_read"], 90)
+        self.assertEqual(s.tokens()["input"], 10)
+
+    def test_empty_usage_then_the_real_one(self):
+        s = bridge_mod.UsageScanner()
+        s.feed(b'{"type":"response.in_progress","response":{"usage":{}}}')
+        self.assertIsNone(s.tokens())
+        s.feed(b'{"type":"response.completed","response":{"usage":'
+               b'{"input_tokens":50,"output_tokens":2,"total_tokens":52}}}')
+        self.assertEqual(s.tokens()["output"], 2)
+
+    def test_non_stream_usage_is_normalised_the_same_way(self):
+        tok = bridge_mod.normalise_usage(
+            {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 80},
+             "output_tokens": 7, "total_tokens": 107})
+        self.assertEqual(tok, {"input": 20, "output": 7, "cache_read": 80,
+                               "cache_creation": 0, "total": 107})
+        self.assertIsNone(bridge_mod.normalise_usage(None))
+        self.assertIsNone(bridge_mod.normalise_usage({}))
 
 
 if __name__ == "__main__":
