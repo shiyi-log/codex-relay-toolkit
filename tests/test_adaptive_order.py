@@ -132,7 +132,8 @@ class ScoringTest(unittest.TestCase):
 
     def set_stats(self, pid, lat, ok, fail):
         bridge_mod._stats[pid] = {"lat": lat, "ok": ok, "fail": fail, "samples": 1,
-                                  "lat_ts": time.time(), "byhour": {}}
+                                  "lat_ts": time.time(), "attempt_ts": time.time(),
+                                  "byhour": {}}
 
     def test_cheapest_and_fastest_wins(self):
         self.set_price("a", 0.10)
@@ -271,14 +272,16 @@ class VariableInputsTest(unittest.TestCase):
 
     def test_exploration_promotes_the_stalest_relay(self):
         routes = dict(self.routes, c={"name": "C", "upstream": "http://c"})
-        for pid, price in (("a", 0.10), ("b", 1.0), ("c", 5.0)):
+        for pid, price in (("a", 0.10), ("b", 1.0), ("c", 0.15)):
             bridge_mod._prices[pid] = {"ts": time.time(), "per_model": {MODEL: price},
                                        "overall": price, "trend": 1.0, "error": ""}
         for pid in ("a", "b"):
             bridge_mod._stats[pid] = {"lat": 0.1, "ok": 1.0, "fail": 0.0, "samples": 1,
-                                      "lat_ts": time.time(), "byhour": {}}
+                                      "lat_ts": time.time(), "attempt_ts": time.time(),
+                                      "byhour": {}}
         bridge_mod._stats["c"] = {"lat": 0.1, "ok": 1.0, "fail": 0.0, "samples": 1,
-                                  "lat_ts": time.time() - 4000, "byhour": {}}
+                                  "lat_ts": time.time() - 4000,
+                                  "attempt_ts": time.time() - 4000, "byhour": {}}
         # normal requests exploit the cheap relay...
         order, _ = bridge_mod.plan_order(routes, ["a", "b", "c"], "a", MODEL)
         self.assertEqual(order[0], "a")
@@ -286,6 +289,42 @@ class VariableInputsTest(unittest.TestCase):
         order, _ = bridge_mod.plan_order(routes, ["a", "b", "c"], "a", MODEL,
                                          explore=True)
         self.assertEqual(order[0], "c")
+
+    def test_exploration_skips_relays_that_cannot_win_on_price(self):
+        routes = dict(self.routes, c={"name": "C", "upstream": "http://c"})
+        for pid, price in (("a", 0.10), ("b", 1.0), ("c", 9.0)):
+            bridge_mod._prices[pid] = {"ts": time.time(), "per_model": {MODEL: price},
+                                       "overall": price, "trend": 1.0, "error": ""}
+        for pid in ("a", "b"):
+            bridge_mod._stats[pid] = {"lat": 0.1, "ok": 1.0, "fail": 0.0, "samples": 1,
+                                      "lat_ts": time.time(), "attempt_ts": time.time(),
+                                      "byhour": {}}
+        bridge_mod._stats["c"] = {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
+                                  "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {}}
+        # c is 90x the cheapest: no speed result could ever make it win, so the
+        # exploration budget is not spent on it
+        order, _ = bridge_mod.plan_order(routes, ["a", "b", "c"], "a", MODEL,
+                                         explore=True)
+        self.assertEqual(order[0], "a")
+
+    def test_exploration_uses_last_attempt_not_last_success(self):
+        routes = dict(self.routes, c={"name": "C", "upstream": "http://c"})
+        for pid in ("a", "b", "c"):
+            bridge_mod._prices[pid] = {"ts": time.time(),
+                                       "per_model": {MODEL: 0.10}, "overall": 0.10,
+                                       "trend": 1.0, "error": ""}
+        bridge_mod._stats["a"] = {"lat": 0.1, "ok": 1.0, "fail": 0.0, "samples": 1,
+                                  "lat_ts": time.time(), "attempt_ts": time.time(),
+                                  "byhour": {}}
+        # b always fails (never a latency sample) but was tried a moment ago
+        bridge_mod._stats["b"] = {"lat": None, "ok": 0.0, "fail": 1.0, "samples": 0,
+                                  "lat_ts": 0.0, "attempt_ts": time.time(), "byhour": {}}
+        bridge_mod._stats["c"] = {"lat": 0.1, "ok": 1.0, "fail": 0.0, "samples": 1,
+                                  "lat_ts": time.time() - 4000,
+                                  "attempt_ts": time.time() - 4000, "byhour": {}}
+        order, _ = bridge_mod.plan_order(routes, ["a", "b", "c"], "a", MODEL,
+                                         explore=True)
+        self.assertEqual(order[0], "c")     # not the relay that keeps failing
 
     def test_never_measured_cheap_relay_gets_warmed_up_once(self):
         for pid, price in (("a", 0.10), ("b", 0.15)):

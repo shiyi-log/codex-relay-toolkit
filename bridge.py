@@ -278,6 +278,11 @@ PRICE_MAX_AGE = float(os.environ.get("BRIDGE_PRICE_MAX_AGE", "21600"))     # 6h
 LATENCY_MAX_AGE = float(os.environ.get("BRIDGE_LATENCY_MAX_AGE", "1800"))  # 30min
 HOUR_MIN_SAMPLES = int(os.environ.get("BRIDGE_HOUR_MIN_SAMPLES", "3"))
 EXPLORE_EVERY = int(os.environ.get("BRIDGE_EXPLORE_EVERY", "50"))
+# Exploration costs a real request, so only spend it on a relay that could
+# actually win: background /v1/usage refresh already catches price changes, so
+# what we lack for a far-more-expensive relay is nothing worth buying. 0 = no
+# price gate.
+EXPLORE_PRICE_FACTOR = float(os.environ.get("BRIDGE_EXPLORE_PRICE_FACTOR", "2.0"))
 # A relay can only win on speed once it has been measured, and the cheapest one
 # would otherwise soak up every request. So while a *reasonably priced* relay
 # has never been measured, promote it once - bounded by the number of such
@@ -307,7 +312,7 @@ _prices_ready = threading.Event()
 def _bucket(pid):
     return _stats.setdefault(
         pid, {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
-              "ts": 0.0, "lat_ts": 0.0, "byhour": {}})
+              "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {}})
 
 
 def record_attempt(pid, seconds=None, failed=False):
@@ -337,6 +342,7 @@ def record_attempt(pid, seconds=None, failed=False):
                     h["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
                 h["samples"] += 1
         b["ts"] = now
+        b["attempt_ts"] = now
 
 
 def effective_latency(pid, now=None):
@@ -358,8 +364,21 @@ def effective_latency(pid, now=None):
 
 
 def last_measured(pid):
+    """When this relay last produced a latency sample (0 = never)."""
     b = _stats.get(pid) or {}
     return b.get("lat_ts") or 0
+
+
+def last_attempt(pid):
+    """When this relay was last *tried*, success or failure.
+
+    Exploration must look at attempts, not at successful measurements: a relay
+    that always fails (dead key, deleted group) never produces a latency sample,
+    so "never measured" would stay true forever and it would be promoted on
+    every exploration forever.
+    """
+    b = _stats.get(pid) or {}
+    return b.get("attempt_ts") or b.get("lat_ts") or 0
 
 
 def weighted_tokens(ms):
@@ -562,21 +581,30 @@ def relay_scores(pids, routes, model):
     return out
 
 
-def pick_explore(pids):
-    """The relay most in need of a fresh measurement (never measured first)."""
-    return min(pids, key=lambda pid: last_measured(pid) or 0) if pids else None
+def pick_explore(pids, scores):
+    """The relay most in need of a fresh try, among those that could win.
+
+    Staleness is measured from the last *attempt* (so a permanently failing
+    relay does not look forever-unexplored), and the price gate keeps the
+    exploration budget away from relays that could never outrank the leaders
+    however fast they turned out to be.
+    """
+    cands = [pid for pid in pids
+             if EXPLORE_PRICE_FACTOR <= 0
+             or scores.get(pid, {}).get("price_norm", 99) <= EXPLORE_PRICE_FACTOR]
+    return min(cands, key=last_attempt) if cands else None
 
 
 def pick_warmup(pids, scores):
-    """A never-measured relay that is cheap enough to be worth measuring.
+    """A never-*tried* relay that is cheap enough to be worth trying.
 
-    Returns the best-scoring such relay, or None. Each promotion measures one
-    relay, so this self-limits to one extra request per unmeasured relay.
+    Returns the best-scoring such relay, or None. Each promotion tries one
+    relay, so this self-limits to one extra request per untried relay.
     """
     if WARMUP_PRICE_FACTOR <= 0:
         return None
     cands = [pid for pid in pids
-             if not last_measured(pid)
+             if not last_attempt(pid)
              and scores.get(pid, {}).get("price_norm", 99) <= WARMUP_PRICE_FACTOR]
     return min(cands, key=lambda pid: scores[pid]["score"]) if cands else None
 
@@ -614,10 +642,11 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
             # measuring a relay we never tried beats re-measuring an old one
             pid, why = pick_warmup(ordered, scores), "WARMUP"
             if pid is None and explore:
-                pid, why = pick_explore(ordered), "EXPLORE"
+                pid, why = pick_explore(ordered, scores), "EXPLORE"
             if pid and pid != ordered[0]:
-                note = ("never measured" if why == "WARMUP"
-                        else "last measured %.0fs ago" % (time.time() - last_measured(pid)))
+                tried = last_attempt(pid)
+                note = ("never tried" if not tried
+                        else "last tried %.0fs ago" % (time.time() - tried))
                 ordered.remove(pid)
                 ordered.insert(0, pid)
                 log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
