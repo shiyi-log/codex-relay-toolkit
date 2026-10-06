@@ -50,6 +50,78 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
   （例如客户端要 `gpt-6.1-sol`、某中转只有 `gpt-6-sol`，就自动降一级用它的），
   而不是直接吃一个 404 白耗一次轮询。模型列表按 `BRIDGE_MODELS_TTL` 缓存（默认 30 分钟）。
   如果该中转整个家族都没有，则不改写、按原样发出去。
+* **顺序不是固定的：按「价格 + 实测速度」动态排。** 见下一节。
+
+### 动态排序：又便宜、又快
+
+`routes.json` 里的 `order` 只是**初始顺序**。运行期每个中转都会被打分，分数只来自能观测的东西：
+
+| 维度 | 来源 |
+|---|---|
+| 价格 | 中转自己 `/v1/usage` 报的 `actual_cost`，折算成**加权百万 token 单价**，后台每 `BRIDGE_PRICE_TTL`（默认 600s）刷新 |
+| 速度 | 本机实测的**首字节时间**（每次请求更新 EWMA，**同时按「一天中的哪个小时」分开记**）|
+| 稳定性 | 衰减的失败率：卡住不出字节、超时、5xx |
+| 模型匹配 | 要的模型这家有没有（只用缓存的 `/v1/models`，打分绝不发网络请求）|
+
+**价格和速度都是变量**，所以这里没有一次性标定，全部是「最近观测」：
+
+* **价格取最近 `BRIDGE_PRICE_DAYS`（默认 3 天）的账单**，不是历史平均值。
+  `/v1/usage` 的 `daily_usage` 给出每天的真实扣费，用它算出「最近价格 / 历史价格」的趋势系数，
+  再乘到每个模型的单价上。**昨天涨价的中转，今天不会继续显得便宜**（趋势上限 5 倍、下限 0.2 倍）。
+* **超过 `BRIDGE_PRICE_MAX_AGE`（默认 6h）没更新过的价格直接不采信**，
+  当作「没有数据」处理，而不是拿旧价格继续排。
+* **速度按小时分桶**：`byhour` 里每个小时各自一条 EWMA，
+  当前小时样本够 `BRIDGE_HOUR_MIN_SAMPLES`（默认 3）就优先用它，
+  所以**高峰期慢下来只影响那个小时**，不会把这个中转一整天都压到底。
+* **超过 `BRIDGE_LATENCY_MAX_AGE`（默认 30 分钟）没测过的速度同样不采信**。
+* **每 `BRIDGE_EXPLORE_EVERY`（默认 50）个请求做一次探索**：把数据最陈旧的中转提到第一位重测一次。
+  这样「变快了/降价了」（或变慢/涨价）的中转能自己爬回来，而不是被一次坏运气永久埋掉；
+  其余 49 个请求仍然老老实实走最便宜最快的那个。
+* **从没测过的中转不会永远没有机会**：只要它的价格在「最便宜 × `BRIDGE_WARMUP_PRICE_FACTOR`
+  （默认 2 倍）」以内，就先测它一次（每个这样的中转只多花一个请求）。
+  否则「更快」永远无从谈起 —— 没人用过它，就永远不知道它快不快；
+  而比最便宜的贵一倍以上的，不花这个钱去测。
+
+规则：
+
+* 分数越低越先试；**最便宜 + 最快 + 不需要降级模型**的排最前。
+* 需要把模型降一级 → `+BRIDGE_MODEL_ADAPT_PENALTY`（默认 0.4）；整个家族都没有 → `+1.5`。
+  **"便宜"永远不会悄悄变成"模型更差"。**
+* 完全没有数据的中转按**中位数**参与排序（探索），不会因为没数据被打入冷宫，
+  也不会凭空白嫖第一位。
+* 排序用上一次的顺序做稳定排序的种子，分数接近时不会来回抖动。
+* 官方订阅账号（`auth_type: "oauth"`）**永远排最后**，仍然单独限次。
+* `BRIDGE_ORDER_MODE=fixed` 可以退回原来的行为：从 CC Switch 选中的那家开始轮询。
+  `BRIDGE_RESPECT_START=1` 则是「仍然从中转选中那家开始，其余按分数排」。
+* **冷启动**：第一次没有价格数据时，第一个请求最多等 `BRIDGE_PRICE_WAIT`（默认 8s）
+  拿到第一轮价格再排（`bridge-state.json` 里还有新鲜数据时不需要等）。
+
+价格是**绝对价格**，不是折扣率：`actual_cost` 除以加权 token 量
+（output 记 4 倍、cache_read 记 0.1 倍、cache_creation 记 1.25 倍），
+这样缓存命中率不同的中转也能公平比较（否则缓存多的那家看起来永远更便宜）。
+
+看当前排序：
+
+```bash
+curl -s "http://127.0.0.1:15888/__bridge/status?text=1"
+```
+
+```
+中转                       score    $/加权M 价格趋势     首字节  样本 失败率  模型  备注
+哈吉米 特惠                  1.21      0.144   x1.00     320ms    18   0.00    ok
+wdlink 福利                  1.83      0.214   x0.85     480ms   240   0.00    ok
+pp 特惠                     2.05      0.051   x1.40     690ms   310   0.00    ok
+pp pro                     3.10      0.230   x1.00       ?ms     0   0.00    ok  价格 4m前
+wdlink  deepseek4.1        ──  查询不到用量（key 已失效）
+```
+
+* `价格趋势`：最近几天 ÷ 历史（`x1.40` = 这家最近涨价了，排序会相应后退）。
+* `样本`／`首字节` 是实测值，超过 `BRIDGE_LATENCY_MAX_AGE` 没再测到就显示 `-`（不采信）。
+
+* 去掉 `?text=1` 就是 JSON；加 `&model=gpt-6.1-sol` 看指定模型的排序。
+* 学到的延迟／失败率／价格存在 `bridge-state.json`（已 git 忽略），重启不用从零开始。
+* 只在**本机**可访问（非回环地址直接 403）。
+* 每次排序变化会在 `bridge.log` 里留一行 `ORDER ...`，方便回看它为什么这么选。
 
 ### 安装
 
@@ -106,6 +178,25 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXHAUST_STATUS` | `400` | 预算用尽时返回的状态码 |
 | `BRIDGE_OFFICIAL_ATTEMPTS` | `10` | 兜底账号的单请求次数上限 |
 | `BRIDGE_MODELS_TTL` | `1800` | 中转模型列表缓存秒数（自动适配模型用）|
+| `BRIDGE_ORDER_MODE` | `adaptive` | `adaptive`＝按价格+实测速度动态排；`fixed`＝原来的固定轮询 |
+| `BRIDGE_RESPECT_START` | `0` | `1`＝仍然先试 CC Switch 选中的那家，其余按分数排 |
+| `BRIDGE_W_PRICE` | `1.0` | 排序公式里价格的权重 |
+| `BRIDGE_W_LATENCY` | `1.0` | 排序公式里首字节时间的权重 |
+| `BRIDGE_W_FAIL` | `2.0` | 排序公式里失败率的权重 |
+| `BRIDGE_MODEL_ADAPT_PENALTY` | `0.4` | 需要降级模型时加的罚分 |
+| `BRIDGE_MODEL_MISSING_PENALTY` | `1.5` | 整个模型家族都没有时加的罚分 |
+| `BRIDGE_PRICE_TTL` | `600` | 价格（`/v1/usage`）刷新间隔秒数 |
+| `BRIDGE_PRICE_TIMEOUT` | `8` | 查询价格的单次超时 |
+| `BRIDGE_PRICE_WAIT` | `8` | 冷启动时首个请求最多等多久拿到第一轮价格（有 `bridge-state.json` 时不需要等）|
+| `BRIDGE_PRICE_DAYS` | `3` | 价格取最近几天的账单（趋势系数）|
+| `BRIDGE_PRICE_MAX_AGE` | `21600` | 超过这么久没刷到的价格不采信（秒）|
+| `BRIDGE_LATENCY_MAX_AGE` | `1800` | 超过这么久没测过的速度不采信（秒）|
+| `BRIDGE_HOUR_MIN_SAMPLES` | `3` | 「当前小时」的延迟样本达到这么多才优先用它 |
+| `BRIDGE_EXPLORE_EVERY` | `50` | 每多少个请求重测一次最陈旧的中转（`0` = 关闭探索）|
+| `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
+| `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
+| `BRIDGE_STATE` | `<脚本目录>/bridge-state.json` | 学到的排序数据（**不要**用 watchdog 的 `state.json`）|
+| `BRIDGE_HOUSEKEEPING` | `30` | 后台线程轮询间隔（刷新价格、落盘状态）|
 | `BRIDGE_PROBE_TIMEOUT` | `10` | `setup.py` 校验候选上游时等的秒数 |
 | `BRIDGE_DB` | `~/.cc-switch/cc-switch.db` | 换一个数据库（测试用）|
 | `BRIDGE_ROUTES` / `BRIDGE_ORIGINALS` | 脚本同目录 | 换 `routes.json` / `originals.json` 的路径（测试用）|

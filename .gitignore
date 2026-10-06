@@ -2,6 +2,7 @@
 routes.json
 originals.json
 state.json
+bridge-state.json
 DISABLED
 model_pricing-bak-*.json
 cost_multiplier-bak-*.json

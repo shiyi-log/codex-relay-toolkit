@@ -19,11 +19,18 @@ is never retried and the turn dies. This bridge therefore owns the retry loop:
 Routing
 -------
 CC Switch calls  /p/<provider-id><prefix><endpoint>  . The bridge strips the
-mount, keeps the endpoint, and for attempt N uses relay number
-(start_index + N) % len(order), rebuilding the path as
-<that relay's upstream><that relay's prefix><endpoint>. Each relay is called
-with **its own API key** (taken from CC Switch's database by setup.py), so
-rotating across relays with different keys works.
+mount, keeps the endpoint, and rebuilds the path as
+<relay upstream><relay prefix><endpoint>. Each relay is called with **its own
+API key** (taken from CC Switch's database by setup.py), so rotating across
+relays with different keys works.
+
+Which relay is tried first is **not fixed**: every relay is scored from its own
+billed price (`GET /v1/usage`, refreshed in the background) and from what this
+machine actually measured - time to first byte and a decayed failure rate. The
+cheapest+fastest relay that serves the requested model is tried first, and a
+relay that is slow, stalling or expensive sinks. `BRIDGE_ORDER_MODE=fixed`
+restores the old "start at the provider CC Switch picked, then round-robin"
+behaviour. `GET /__bridge/status?text=1` prints the current ranking.
 
 A response that is not retryable (auth, malformed request, ...) is passed
 through untouched. When every attempt is used up the bridge answers with a
@@ -44,7 +51,7 @@ import threading
 import time
 from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -229,6 +236,507 @@ _models_cache = {}
 _models_lock = threading.Lock()
 MODEL_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?-([A-Za-z0-9.]+)$")
 MODELS_TTL = float(os.environ.get("BRIDGE_MODELS_TTL", "1800"))
+
+# ----------------------------------------------------------- adaptive order
+# routes.json's `order` is only the *starting* order. At runtime every relay
+# gets a score from the two things the bridge can actually observe:
+#
+#   price   what the relay itself bills (`GET /v1/usage` -> actual_cost per
+#           weighted million tokens), refreshed in the background
+#   speed   time-to-first-byte measured on this machine (EWMA per relay) plus a
+#           decayed failure rate: stalls, timeouts, 5xx
+#
+# Lowest score is tried first. A relay that would need the model adapted (or
+# has none of that family) pays a penalty, so "cheap" never silently turns into
+# "worse model", and a relay we have no data for sits mid-pack (exploration)
+# rather than dead last.
+ORDER_MODE = os.environ.get("BRIDGE_ORDER_MODE", "adaptive").lower()
+RESPECT_START = os.environ.get("BRIDGE_RESPECT_START", "0") == "1"
+W_PRICE = float(os.environ.get("BRIDGE_W_PRICE", "1.0"))
+W_LATENCY = float(os.environ.get("BRIDGE_W_LATENCY", "1.0"))
+W_FAIL = float(os.environ.get("BRIDGE_W_FAIL", "2.0"))
+MODEL_ADAPT_PENALTY = float(os.environ.get("BRIDGE_MODEL_ADAPT_PENALTY", "0.4"))
+MODEL_MISSING_PENALTY = float(os.environ.get("BRIDGE_MODEL_MISSING_PENALTY", "1.5"))
+EWMA_ALPHA = float(os.environ.get("BRIDGE_EWMA_ALPHA", "0.3"))
+PRICE_TTL = float(os.environ.get("BRIDGE_PRICE_TTL", "600"))
+PRICE_TIMEOUT = float(os.environ.get("BRIDGE_PRICE_TIMEOUT", "8"))
+# how long a request may wait at cold start for the first price refresh
+PRICE_WAIT = float(os.environ.get("BRIDGE_PRICE_WAIT", "8"))
+# Price and speed are both *variables*, so nothing here is a one-off calibration:
+#
+#   price   taken from the relay's last BRIDGE_PRICE_DAYS days of billing, not
+#           from its all-time average (a relay that raised prices yesterday must
+#           not look cheap today); the per-model figure is scaled by that recent
+#           trend. Anything older than BRIDGE_PRICE_MAX_AGE is not trusted.
+#   speed   EWMA overall *and* per hour of the day (peak hours differ), and a
+#           figure older than BRIDGE_LATENCY_MAX_AGE is not trusted either.
+#   stale   relays whose numbers went stale get re-measured on every
+#           BRIDGE_EXPLORE_EVERY-th request, so a relay that got faster/cheaper
+#           (or slower/pricier) can climb back without being hammered.
+PRICE_DAYS = int(os.environ.get("BRIDGE_PRICE_DAYS", "3"))
+PRICE_MAX_AGE = float(os.environ.get("BRIDGE_PRICE_MAX_AGE", "21600"))     # 6h
+LATENCY_MAX_AGE = float(os.environ.get("BRIDGE_LATENCY_MAX_AGE", "1800"))  # 30min
+HOUR_MIN_SAMPLES = int(os.environ.get("BRIDGE_HOUR_MIN_SAMPLES", "3"))
+EXPLORE_EVERY = int(os.environ.get("BRIDGE_EXPLORE_EVERY", "50"))
+# A relay can only win on speed once it has been measured, and the cheapest one
+# would otherwise soak up every request. So while a *reasonably priced* relay
+# has never been measured, promote it once - bounded by the number of such
+# relays, and never for relays pricier than BRIDGE_WARMUP_PRICE_FACTOR x the
+# cheapest. 0 disables warm-up.
+WARMUP_PRICE_FACTOR = float(os.environ.get("BRIDGE_WARMUP_PRICE_FACTOR", "2.0"))
+HOUSEKEEPING_SECONDS = float(os.environ.get("BRIDGE_HOUSEKEEPING", "30"))
+# NOT state.json - that one belongs to watchdog.py
+STATE_FILE = os.environ.get("BRIDGE_STATE", os.path.join(BASE_DIR, "bridge-state.json"))
+STATE_TTL = float(os.environ.get("BRIDGE_STATE_TTL", "86400"))
+# Relative weights that turn a relay's token mix into "weighted million
+# tokens". Output is ~4x input and cache reads ~0.1x on every OpenAI model, so
+# this makes relays with different cache-hit ratios comparable.
+TOKEN_WEIGHTS = {"input_tokens": 1.0, "output_tokens": 4.0,
+                 "cache_read_tokens": 0.1, "cache_creation_tokens": 1.25}
+
+_stats_lock = threading.Lock()
+_stats = {}       # pid -> {"lat", "ok", "fail", "samples", "ts", "lat_ts", "byhour"}
+_prices = {}      # pid -> {"ts", "per_model", "overall", "trend", "error"}
+_last_plan = {"order": [], "signature": ""}
+_explore = {"n": 0}
+# set once the first price refresh has landed; requests arriving during a cold
+# start wait for it for a moment instead of ordering on the fixed list
+_prices_ready = threading.Event()
+
+
+def _bucket(pid):
+    return _stats.setdefault(
+        pid, {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
+              "ts": 0.0, "lat_ts": 0.0, "byhour": {}})
+
+
+def record_attempt(pid, seconds=None, failed=False):
+    """Feed one attempt into the relay's score.
+
+    Two axes, both time-varying: EWMA overall and EWMA for the current hour of
+    the day, so peak-hour slowness is remembered for that hour instead of
+    dragging the relay down all day.
+    """
+    with _stats_lock:
+        b = _bucket(pid)
+        now = time.time()
+        if failed:
+            b["fail"] = b["fail"] * (1 - EWMA_ALPHA) + EWMA_ALPHA
+            b["ok"] *= 1 - EWMA_ALPHA
+        else:
+            b["ok"] = b["ok"] * (1 - EWMA_ALPHA) + EWMA_ALPHA
+            b["fail"] *= 1 - EWMA_ALPHA
+            if seconds is not None:
+                b["lat"] = seconds if b["lat"] is None else (
+                    b["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
+                b["samples"] += 1
+                b["lat_ts"] = now
+                hour = str(time.localtime(now).tm_hour)
+                h = b["byhour"].setdefault(hour, {"lat": None, "samples": 0})
+                h["lat"] = seconds if h["lat"] is None else (
+                    h["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
+                h["samples"] += 1
+        b["ts"] = now
+
+
+def effective_latency(pid, now=None):
+    """Latency used for scoring: this hour's figure when we have enough
+    samples for it, otherwise the recent overall figure.
+
+    Speed is a variable: a figure older than BRIDGE_LATENCY_MAX_AGE is dropped
+    (returns None -> the relay scores as "no data"), and the periodic
+    exploration below re-measures it.
+    """
+    now = now or time.time()
+    b = _stats.get(pid) or {}
+    if not b.get("lat") or now - (b.get("lat_ts") or 0) > LATENCY_MAX_AGE:
+        return None
+    hour = (b.get("byhour") or {}).get(str(time.localtime(now).tm_hour))
+    if hour and hour.get("samples", 0) >= HOUR_MIN_SAMPLES and hour.get("lat"):
+        return hour["lat"]
+    return b["lat"]
+
+
+def last_measured(pid):
+    b = _stats.get(pid) or {}
+    return b.get("lat_ts") or 0
+
+
+def weighted_tokens(ms):
+    return sum((ms.get(k) or 0) * w for k, w in TOKEN_WEIGHTS.items()) / 1e6
+
+
+def parse_usage(data, days=None):
+    """Turn one /v1/usage body into a price picture.
+
+    per_model: all-time $ per weighted million tokens, per model
+    trend:     recent (last `days` days) price / all-time price, >1 = got
+               pricier, <1 = got cheaper - the per-model figures are scaled by
+               it so a relay that changed its price does not keep yesterday's
+               reputation
+    """
+    days = PRICE_DAYS if days is None else days
+    per_model = {}
+    total_cost = total_weighted = 0.0
+    for ms in data.get("model_stats") or []:
+        cost = ms.get("actual_cost")
+        if cost is None:
+            cost = ms.get("account_cost")
+        if cost is None:
+            cost = ms.get("cost")
+        weighted = weighted_tokens(ms)
+        if cost is None or weighted <= 0 or not ms.get("model"):
+            continue
+        per_model[ms["model"]] = float(cost) / weighted
+        total_cost += float(cost)
+        total_weighted += weighted
+    alltime = (total_cost / total_weighted) if total_weighted > 0 else None
+
+    daily = data.get("daily_usage") or []
+    recent_cost = recent_weighted = 0.0
+    for day in daily[-days:] if days > 0 else daily:
+        cost = day.get("actual_cost")
+        if cost is None:
+            cost = day.get("cost")
+        if cost is None:
+            continue
+        # daily rows call cache-creation "cache_write"
+        weighted = weighted_tokens({"input_tokens": day.get("input_tokens"),
+                                    "output_tokens": day.get("output_tokens"),
+                                    "cache_read_tokens": day.get("cache_read_tokens"),
+                                    "cache_creation_tokens": day.get("cache_write_tokens")})
+        recent_cost += float(cost)
+        recent_weighted += weighted
+    recent = (recent_cost / recent_weighted) if recent_weighted > 0 else None
+    trend = 1.0
+    if recent and alltime and alltime > 0:
+        trend = min(5.0, max(0.2, recent / alltime))
+    scaled = {m: v * trend for m, v in per_model.items()}
+    return {"per_model": scaled, "overall": (recent or alltime),
+            "alltime": alltime, "trend": trend, "days": days,
+            "daily_days": len(daily)}
+
+
+def fetch_price(route):
+    """Relay-reported price per weighted million tokens. Uses the relay's own
+    billing (`actual_cost`), so it is what this relay really charges - not what
+    its price list claims."""
+    prefix = (route.get("prefix") or "").rstrip("/")
+    err = "no usage data"
+    for path in (prefix + "/usage", "/v1/usage"):
+        try:
+            req = urllib.request.Request(
+                route["upstream"] + path,
+                headers={"Authorization": "Bearer " + (route.get("auth") or ""),
+                         "User-Agent": "curl/8.7.1", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=PRICE_TIMEOUT) as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            err = str(exc)[:80]
+            continue
+        parsed = parse_usage(data)
+        if not parsed["per_model"]:
+            err = "no billable usage yet"
+            continue
+        parsed["ts"] = time.time()
+        parsed["error"] = ""
+        return parsed
+    return {"ts": time.time(), "per_model": {}, "overall": None, "alltime": None,
+            "trend": 1.0, "days": PRICE_DAYS, "daily_days": 0, "error": err}
+
+
+def refresh_prices(routes, force=False):
+    """Refresh every relay's price in parallel; never blocks a request."""
+    now = time.time()
+    todo = []
+    with _stats_lock:
+        for pid, route in routes.items():
+            if route.get("auth_type") == "oauth":
+                continue
+            if not force and now - (_prices.get(pid) or {}).get("ts", 0) < PRICE_TTL:
+                continue
+            todo.append((pid, dict(route)))
+    if not todo:
+        return
+    threads = []
+
+    def work(pid, route):
+        ent = fetch_price(route)
+        with _stats_lock:
+            _prices[pid] = ent
+
+    for pid, route in todo:
+        th = threading.Thread(target=work, args=(pid, route), daemon=True)
+        th.start()
+        threads.append(th)
+    deadline = time.time() + PRICE_TIMEOUT + 10
+    for th in threads:
+        th.join(max(0.0, deadline - time.time()))
+    bad = [pid for pid, _ in todo if (_prices.get(pid) or {}).get("error")]
+    # released even when nothing came back: the cold-start wait must cost at
+    # most one request, never one wait per request
+    _prices_ready.set()
+    log("PRICE refreshed %d relay(s)%s"
+        % (len(todo), "" if not bad else ", %d without data" % len(bad)))
+
+
+def price_index(pid, model, now=None):
+    """(price, exact_model_for_this_model) or (None, False) when we have
+    nothing trustworthy. Price is a variable: a reading older than
+    BRIDGE_PRICE_MAX_AGE is dropped rather than trusted, and the background
+    refresh replaces it."""
+    now = now or time.time()
+    ent = _prices.get(pid) or {}
+    if not ent.get("ts") or now - ent["ts"] > PRICE_MAX_AGE:
+        return None, False
+    per = ent.get("per_model") or {}
+    if model and model in per:
+        return per[model], True
+    if ent.get("overall"):
+        return ent["overall"], False
+    return None, False
+
+
+def model_penalty(pid, model):
+    """How much this relay costs us in *model quality* for this request.
+
+    Uses the cached /v1/models list only - scoring must never do network I/O.
+    """
+    if not model:
+        return 0.0
+    with _models_lock:
+        ent = _models_cache.get(pid)
+    ids = (ent or {}).get("ids") or set()
+    if not ids or model in ids:
+        return 0.0
+    m = MODEL_RE.match(model)
+    if m and any((p := MODEL_RE.match(i)) and p.group(3) == m.group(3)
+                 for i in ids):
+        return MODEL_ADAPT_PENALTY
+    return MODEL_MISSING_PENALTY
+
+
+def relay_scores(pids, routes, model):
+    """Score every relay: lower is better. Unknown data -> mid-pack."""
+    prices, lats = {}, {}
+    for pid in pids:
+        prices[pid], _exact = price_index(pid, model)
+        lats[pid] = effective_latency(pid)
+    known_p = sorted(v for v in prices.values() if v)
+    known_l = sorted(v for v in lats.values() if v)
+    min_p = known_p[0] if known_p else None
+    med_p = known_p[len(known_p) // 2] if known_p else None
+    min_l = known_l[0] if known_l else None
+    med_l = known_l[len(known_l) // 2] if known_l else None
+
+    out = {}
+    for pid in pids:
+        b = _stats.get(pid) or {}
+        err = b.get("fail", 0.0)
+        ok = b.get("ok", 0.0)
+        fail_rate = err / (ok + err) if (ok + err) > 0 else 0.0
+        price, exact = prices[pid], price_index(pid, model)[1]
+        if price and min_p:
+            p_norm = price / min_p
+        elif med_p and min_p:
+            p_norm = med_p / min_p
+        else:
+            p_norm = 1.0
+        lat = lats[pid]
+        if lat and min_l:
+            l_norm = lat / min_l
+        elif med_l and min_l:
+            l_norm = med_l / min_l
+        else:
+            l_norm = 1.0
+        pen = model_penalty(pid, model)
+        out[pid] = {
+            "score": W_PRICE * p_norm + W_LATENCY * l_norm + W_FAIL * fail_rate + pen,
+            "price_per_m": price, "price_norm": p_norm,
+            "latency": lat, "latency_norm": l_norm,
+            "fail_rate": fail_rate, "model_penalty": pen,
+            "exact_model": exact,
+            "samples": b.get("samples", 0),
+            "error": (_prices.get(pid) or {}).get("error", ""),
+        }
+    return out
+
+
+def pick_explore(pids):
+    """The relay most in need of a fresh measurement (never measured first)."""
+    return min(pids, key=lambda pid: last_measured(pid) or 0) if pids else None
+
+
+def pick_warmup(pids, scores):
+    """A never-measured relay that is cheap enough to be worth measuring.
+
+    Returns the best-scoring such relay, or None. Each promotion measures one
+    relay, so this self-limits to one extra request per unmeasured relay.
+    """
+    if WARMUP_PRICE_FACTOR <= 0:
+        return None
+    cands = [pid for pid in pids
+             if not last_measured(pid)
+             and scores.get(pid, {}).get("price_norm", 99) <= WARMUP_PRICE_FACTOR]
+    return min(cands, key=lambda pid: scores[pid]["score"]) if cands else None
+
+
+def plan_order(routes, base_order, start_pid, model, remember=True, explore=False):
+    """The attempt order for one request.
+
+    adaptive (default): cheapest + fastest first, subscription account last,
+    ties fall back to the previous plan (stable sort) so it does not thrash.
+    fixed: the old behaviour - rotate from the provider CC Switch selected.
+    explore: promote the relay whose numbers are stalest, because price and
+    speed both drift; used once every BRIDGE_EXPLORE_EVERY requests.
+    """
+    pids = [p for p in base_order if p in routes]
+    oauth = [p for p in pids if routes[p].get("auth_type") == "oauth"]
+    normal = [p for p in pids if p not in oauth]
+    scores = relay_scores(normal, routes, model)
+
+    if ORDER_MODE == "fixed":
+        if start_pid in normal:
+            i = normal.index(start_pid)
+            normal = normal[i:] + normal[:i]
+        ordered = normal
+    else:
+        prev = [p for p in _last_plan["order"] if p in normal]
+        seed = prev + [p for p in normal if p not in prev]
+        if RESPECT_START:
+            ordered = sorted([p for p in seed if p != start_pid],
+                             key=lambda p: scores[p]["score"])
+            if start_pid in scores:
+                ordered.insert(0, start_pid)
+        else:
+            ordered = sorted(seed, key=lambda p: scores[p]["score"])
+        if len(ordered) > 1:
+            # measuring a relay we never tried beats re-measuring an old one
+            pid, why = pick_warmup(ordered, scores), "WARMUP"
+            if pid is None and explore:
+                pid, why = pick_explore(ordered), "EXPLORE"
+            if pid and pid != ordered[0]:
+                note = ("never measured" if why == "WARMUP"
+                        else "last measured %.0fs ago" % (time.time() - last_measured(pid)))
+                ordered.remove(pid)
+                ordered.insert(0, pid)
+                log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
+    ordered = ordered + oauth
+    if remember:
+        _last_plan["order"] = ordered
+    return ordered, scores
+
+
+def _ago(seconds):
+    if seconds is None:
+        return "?"
+    if seconds < 90:
+        return "%ds" % seconds
+    if seconds < 5400:
+        return "%dm" % (seconds // 60)
+    return "%.1fh" % (seconds / 3600.0)
+
+
+def log_plan(ordered, scores, model):
+    """Log the ranking once per change, not once per request."""
+    sig = "|".join(ordered) + "#" + (model or "")
+    if sig == _last_plan["signature"]:
+        return
+    _last_plan["signature"] = sig
+    parts = []
+    for pid in ordered:
+        s = scores.get(pid)
+        if not s:
+            parts.append(pid[:8])
+            continue
+        price = "%.2f/M" % s["price_per_m"] if s["price_per_m"] else "?/M"
+        lat = "%.0fms" % (s["latency"] * 1000) if s["latency"] else "?"
+        parts.append("%s[%s %s fail%.2f p%.1f]"
+                     % (pid[:8], price, lat, s["fail_rate"], s["score"]))
+    log("ORDER %s -> %s" % (model or "(no model)", " > ".join(parts)))
+
+
+def status_snapshot(routes, base_order, model):
+    ordered, scores = plan_order(routes, base_order, None, model, remember=False)
+    now = time.time()
+    rows = []
+    for pid in ordered:
+        route = routes[pid]
+        s = scores.get(pid) or {}
+        ent = _prices.get(pid) or {}
+        b = _stats.get(pid) or {}
+        price = s.get("price_per_m")
+        rows.append({
+            "id": pid, "name": route.get("name"), "upstream": route.get("upstream"),
+            "auth_type": route.get("auth_type") or "bearer",
+            "score": round(s["score"], 3) if s else None,
+            "price_per_m": round(price, 4) if price else None,
+            "price_norm": round(s["price_norm"], 3) if s else None,
+            "price_trend": round(ent.get("trend", 1.0), 3) if ent else None,
+            "price_age_s": int(now - ent["ts"]) if ent.get("ts") else None,
+            "price_note": (s.get("error") or ent.get("error") or ""),
+            "latency_ms": round(s["latency"] * 1000, 1) if s.get("latency") else None,
+            "latency_age_s": (int(now - (b.get("lat_ts") or 0))
+                              if b.get("lat_ts") else None),
+            "latency_samples": b.get("samples", 0),
+            "hour_samples": (b.get("byhour") or {}).get(
+                str(time.localtime(now).tm_hour), {}).get("samples", 0),
+            "fail_rate": round(s["fail_rate"], 3) if s else None,
+            "model_penalty": s.get("model_penalty"),
+        })
+    return {"mode": ORDER_MODE, "respect_start": RESPECT_START,
+            "model": model, "order": ordered, "routes": rows,
+            "price_days": PRICE_DAYS,
+            "price_max_age_s": int(PRICE_MAX_AGE),
+            "latency_max_age_s": int(LATENCY_MAX_AGE),
+            "explore_every": EXPLORE_EVERY}
+
+
+def save_state():
+    with _stats_lock:
+        snap = {"ts": time.time(), "stats": _stats, "prices": _prices}
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(snap, fh)
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        log("state save failed: %s" % exc)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            snap = json.load(fh)
+    except Exception:
+        return
+    age = time.time() - float(snap.get("ts") or 0)
+    if age > STATE_TTL:
+        log("state ignored (%.0fh old)" % (age / 3600))
+        return
+    with _stats_lock:
+        _stats.update(snap.get("stats") or {})
+        for pid, ent in (snap.get("prices") or {}).items():
+            if ent.get("per_model") and age <= PRICE_TTL:
+                _prices[pid] = ent
+    if _prices:
+        _prices_ready.set()
+    log("state restored (%d relay stats, %d price sets)"
+        % (len(_stats), len(_prices)))
+
+
+def housekeeping():
+    """Background price refresh + state save. Never touches request handling."""
+    while True:
+        try:
+            with _state_lock:
+                routes = dict(_state["routes"])
+            if routes:
+                refresh_prices(routes)
+            save_state()
+        except Exception as exc:                                   # pragma: no cover
+            log("housekeeping failed: %r" % exc)
+        time.sleep(HOUSEKEEPING_SECONDS)
 
 
 def route_models(pid, route):
@@ -415,8 +923,58 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             log("CLIENT-GONE / upstream cut mid-stream: %s" % exc)
 
+    def _status(self, split):
+        """GET /__bridge/status[?model=...][&text=1] - the live ranking."""
+        client = (self.client_address or ("",))[0]
+        if client not in ("127.0.0.1", "::1"):
+            self._send(403, [("Content-Type", "application/json")],
+                       b'{"error":{"message":"local only"}}')
+            return
+        query = {}
+        for part in split.query.split("&"):
+            if "=" in part:
+                key, _, value = part.partition("=")
+                query[key] = unquote(value)
+        model = query.get("model") or None
+        with _state_lock:
+            routes = dict(_state["routes"])
+            base_order = list(_state["order"])
+            attempts = _state["attempts"]
+        snap = status_snapshot(routes, base_order, model)
+        snap["attempts"] = attempts
+        if "text" in query:
+            lines = ["%-22s %7s %10s %6s %9s %5s %6s %5s  %s"
+                     % ("中转", "score", "$/加权M", "价格趋势", "首字节", "样本",
+                        "失败率", "模型", "备注")]
+            for row in snap["routes"]:
+                if row["auth_type"] == "oauth":
+                    lines.append("%-22s %7s %10s %6s %9s %5s %6s %5s  %s"
+                                 % (row["name"][:22], "-", "-", "-", "-", "-", "-",
+                                    "-", "oauth 账号，固定队尾"))
+                    continue
+                age = row["price_age_s"]
+                lines.append("%-22s %7s %10s %6s %9s %5s %6s %5s  %s"
+                             % (row["name"][:22],
+                                row["score"] if row["score"] is not None else "-",
+                                ("%.3f" % row["price_per_m"]) if row["price_per_m"] else "-",
+                                ("x%.2f" % row["price_trend"]) if row["price_trend"] else "-",
+                                ("%.0fms" % row["latency_ms"]) if row["latency_ms"] else "-",
+                                row["latency_samples"] or "-",
+                                ("%.2f" % row["fail_rate"]) if row["fail_rate"] is not None else "-",
+                                ("-%.1f" % row["model_penalty"]) if row["model_penalty"] else "ok",
+                                row["price_note"]
+                                or ("价格 %s前" % _ago(age) if age is not None else "")))
+            body = ("\n".join(lines) + "\n").encode("utf-8")
+            self._send(200, [("Content-Type", "text/plain; charset=utf-8")], body)
+            return
+        body = json.dumps(snap, ensure_ascii=False).encode("utf-8")
+        self._send(200, [("Content-Type", "application/json")], body)
+
     def _handle(self, method):
         split = urlsplit(self.path)
+        if split.path in ("/__bridge/status", "/__bridge/ranking"):
+            self._status(split)
+            return
         resolved = resolve(split.path)
         if resolved is None:
             body = json.dumps({"error": {
@@ -438,10 +996,26 @@ class Handler(BaseHTTPRequestHandler):
         base_headers = self._base_headers()
         base_headers["Content-Length"] = str(len(request_body))
 
-        start_index = order.index(start_pid) if start_pid in order else 0
         with _state_lock:
             routes = dict(_state["routes"])
             attempts = _state["attempts"]
+            base_order = list(_state["order"])
+
+        wanted = None
+        try:
+            wanted = (json.loads(request_body.decode("utf-8")) or {}).get("model")
+        except Exception:
+            pass
+        _explore["n"] += 1
+        explore = EXPLORE_EVERY > 0 and _explore["n"] % EXPLORE_EVERY == 0
+        if ORDER_MODE != "fixed" and not _prices_ready.is_set():
+            # cold start (no fresh bridge-state.json): wait a moment for the
+            # first price refresh so the very first request is already ordered
+            # by price, instead of falling back to the fixed list
+            _prices_ready.wait(PRICE_WAIT)
+        ordered, scores = plan_order(routes, base_order, start_pid, wanted,
+                                     explore=explore)
+        log_plan(ordered, scores, wanted)
 
         start_time = time.time()
         last = {"status": None, "headers": [("Content-Type", "application/json")], "body": b""}
@@ -451,8 +1025,8 @@ class Handler(BaseHTTPRequestHandler):
         skipped = 0
         cursor = 0
         netfails = 0         # consecutive connection/TLS-level failures
-        while done < attempts and skipped < len(order):
-            pid = order[(start_index + cursor) % len(order)]
+        while done < attempts and skipped < len(ordered):
+            pid = ordered[cursor % len(ordered)]
             cursor += 1
             route = routes[pid]
 
@@ -495,6 +1069,7 @@ class Handler(BaseHTTPRequestHandler):
                 headers["Content-Length"] = str(len(attempt_body))
 
             conn = None
+            attempt_started = time.time()
             try:
                 conn, resp = open_upstream(method, url, headers, attempt_body)
                 status = resp.status
@@ -528,9 +1103,12 @@ class Handler(BaseHTTPRequestHandler):
                                     "message": "retry bridge: empty or stalled stream",
                                     "type": "upstream_error"}}).encode()}
                         netfails += 1
+                        record_attempt(pid, failed=True)
                         conn.close()
                         conn = None
                     else:
+                        # first byte is what "faster to call" really means here
+                        record_attempt(pid, time.time() - attempt_started)
                         log("OK    %s %s -> %s via %s (attempt %d/%d)"
                             % (method, split.path, status, route["name"], done, attempts))
                         self._stream(status, raw_headers, resp, head)
@@ -544,17 +1122,21 @@ class Handler(BaseHTTPRequestHandler):
                 retryable = status in RETRY_STATUS or is_retryable_body(body)
 
                 if not retryable:
+                    if status == 200:
+                        record_attempt(pid, time.time() - attempt_started)
                     log("PASS  %s %s -> %s via %s (attempt %d)"
                         % (method, split.path, status, route["name"], done))
                     self._send(status, raw_headers, body)
                     return
 
+                record_attempt(pid, failed=True)
                 last = {"status": status, "headers": raw_headers, "body": body}
                 netfails = 0
                 snippet = body[:120].decode("utf-8", "replace").replace("\n", " ")
                 log("RETRY %s %s -> %s via %s (attempt %d/%d) %s"
                     % (method, split.path, status, route["name"], done, attempts, snippet))
             except (socket.timeout, OSError) as exc:
+                record_attempt(pid, failed=True)
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {
@@ -564,6 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
                 log("RETRY %s %s -> network error via %s (attempt %d/%d, net-streak %d): %s"
                     % (method, split.path, route["name"], done, attempts, netfails, exc))
             except Exception as exc:                                   # pragma: no cover
+                record_attempt(pid, failed=True)
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {
@@ -644,12 +1227,16 @@ class BridgeServer(ThreadingHTTPServer):
 
 
 def main():
+    load_state()
     load_routes(force=True)
+    threading.Thread(target=housekeeping, daemon=True).start()
     host = os.environ.get("BRIDGE_HOST", "127.0.0.1")
     port = int(os.environ.get("BRIDGE_PORT", "15888"))
     server = BridgeServer((host, port), Handler)
-    log("retry bridge listening on %s:%d (backlog=%d, first-byte timeout=%.0fs)"
-        % (host, port, server.request_queue_size, FIRST_BYTE_TIMEOUT))
+    log("retry bridge listening on %s:%d (order=%s, attempts=%d, backlog=%d, "
+        "first-byte timeout=%.0fs)"
+        % (host, port, ORDER_MODE, _state["attempts"], server.request_queue_size,
+           FIRST_BYTE_TIMEOUT))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
