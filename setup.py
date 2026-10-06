@@ -4,6 +4,7 @@
 
 Run this after adding, duplicating or renaming a relay in CC Switch:
 
+    python3 ~/.ccswitch-retry-bridge/setup.py --dry-run   # show what would change
     python3 ~/.ccswitch-retry-bridge/setup.py
 
 It is idempotent. For every third-party (non-official) Codex provider it:
@@ -11,11 +12,15 @@ It is idempotent. For every third-party (non-official) Codex provider it:
   1. works out the provider's real upstream, even when the provider was
      *duplicated* in the CC Switch UI after a previous run (a duplicate copies
      the bridge URL of the provider it was cloned from, so it would otherwise
-     keep pointing at someone else's route);
+     keep pointing at someone else's route). For a copy the mount only says who
+     it came from, so the real upstream is resolved from this provider's own
+     recorded original or from CC Switch's `website_url`, and accepted only if
+     this provider's own API key answers on it;
   2. rewrites base_url to
          http://127.0.0.1:<port>/p/<provider-id><original-path>
      so CC Switch hands the call to the bridge;
   3. points the provider's usage_script at its own relay (same duplicate trap);
+     this is what makes CC Switch's balance query show the right relay;
   4. puts the provider into CC Switch's failover queue and gives it a
      sort_index if it has none.
 
@@ -28,12 +33,14 @@ import os
 import re
 import sqlite3
 import sys
+import urllib.request
 from urllib.parse import urlsplit
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROUTES_FILE = os.path.join(BASE_DIR, "routes.json")
-ORIGINALS_FILE = os.path.join(BASE_DIR, "originals.json")
-DB_PATH = os.path.expanduser("~/.cc-switch/cc-switch.db")
+ROUTES_FILE = os.environ.get("BRIDGE_ROUTES", os.path.join(BASE_DIR, "routes.json"))
+ORIGINALS_FILE = os.environ.get("BRIDGE_ORIGINALS",
+                                os.path.join(BASE_DIR, "originals.json"))
+DB_PATH = os.environ.get("BRIDGE_DB", os.path.expanduser("~/.cc-switch/cc-switch.db"))
 PORT = int(os.environ.get("BRIDGE_PORT", "15888"))
 ATTEMPTS = int(os.environ.get("BRIDGE_ATTEMPTS", "100"))
 MARKER = "127.0.0.1:%d/p/" % PORT
@@ -43,6 +50,9 @@ AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
 OFFICIAL_ATTEMPTS = int(os.environ.get("BRIDGE_OFFICIAL_ATTEMPTS", "10"))
 MOUNT_RE = re.compile(r"/p/([0-9a-fA-F]{8}-[0-9a-fA-F-]{4,})")
 BASE_URL_RE = re.compile(r'base_url\s*=\s*"([^"]+)"')
+# how long to wait when probing a relay for this provider's own key
+PROBE_TIMEOUT = float(os.environ.get("BRIDGE_PROBE_TIMEOUT", "10"))
+DRY_RUN = "--dry-run" in sys.argv
 
 
 def load_json(path, default):
@@ -58,6 +68,76 @@ def load_json(path, default):
 def upstream_root(url):
     parts = urlsplit(url)
     return "%s://%s" % (parts.scheme, parts.netloc)
+
+
+def probe_prefix(root, key):
+    """Find a path prefix under `root` that answers /models for this API key.
+
+    Returns "" , "/v1" , ... or None. Relays are inconsistent: some serve the
+    OpenAI-compatible API at the site root, some only under /v1. Probing the
+    provider's *own* key is also how we tell a real upstream apart from a
+    neighbouring relay that merely happens to answer.
+    """
+    if not key:
+        return None
+    for prefix in ("", "/v1"):
+        try:
+            req = urllib.request.Request(
+                root + prefix + "/models",
+                headers={"Authorization": "Bearer " + key,
+                         # a few relays 403 the default python-urllib UA
+                         "User-Agent": "curl/8.7.1",
+                         "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as fh:
+                if 200 <= fh.status < 300:
+                    return prefix
+        except Exception:
+            continue
+    return None
+
+
+def resolve_original(pid, known, website, key):
+    """Real upstream for a provider whose base_url is a bridge mount.
+
+    A copied provider inherits the *source's* mount, so the mount only tells us
+    who it was copied from - never what this provider actually is. Using the
+    source's upstream is the trap (new relay silently sends its key to the old
+    relay, which answers 401, and both the balance query and the real-price
+    query fail for it).
+
+    Ground truth, in order:
+      1. this provider's own recorded original (originals.json / previous route)
+      2. the site URL CC Switch stores on the provider (`website_url`)
+    A candidate that carries no path is accepted only if this provider's own key
+    answers on it, so we never point a provider at somebody else's relay.
+
+    -> (original_base_url, source, verified) or (None, "", False)
+    """
+    candidates = []
+    recorded = (known.get(pid) or "").strip().rstrip("/")
+    if recorded:
+        candidates.append((recorded, "originals.json"))
+    site = (website or "").strip().rstrip("/")
+    if site:
+        site_root = upstream_root(site)
+        if site_root and all(site_root != upstream_root(c) for c, _ in candidates):
+            candidates.append((site_root, "CC Switch website_url"))
+    if not candidates:
+        return None, "", False
+
+    unverified = None
+    for candidate, source in candidates:
+        root = upstream_root(candidate)
+        prefix = urlsplit(candidate).path.rstrip("/")
+        if prefix:
+            # a real base_url path (e.g. https://relay/v1) is ground truth itself
+            return root + prefix, source, True
+        probed = probe_prefix(root, key)
+        if probed is not None:
+            return root + probed, source, True
+        if unverified is None:
+            unverified = (root, source, False)
+    return unverified
 
 
 def normalize_client_config(conf):
@@ -123,25 +203,26 @@ def main():
 
     conn = sqlite3.connect(DB_PATH)
     rows = list(conn.execute(
-        "SELECT id, name, settings_config, meta, in_failover_queue, sort_index "
-        "FROM providers WHERE app_type='codex' "
+        "SELECT id, name, settings_config, meta, in_failover_queue, sort_index, "
+        "website_url FROM providers WHERE app_type='codex' "
         "AND (category IS NULL OR category<>'official') ORDER BY sort_index IS NULL, sort_index"))
     if not rows:
         sys.exit("no third-party codex providers found")
 
-    for pid, name, cfg_raw, _meta, _fq, _si in rows:
+    for pid, name, cfg_raw, _meta, _fq, _si, _web in rows:
         conf = (json.loads(cfg_raw).get("config") or "")
         match = BASE_URL_RE.search(conf)
-        # only a *direct* base_url teaches us the real upstream
+        # a *direct* base_url is the freshest ground truth: the user may have
+        # re-pointed this provider in CC Switch since the last run
         if match and MARKER not in match.group(1):
-            known.setdefault(pid, match.group(1))
+            known[pid] = match.group(1)
 
     # ---- pass 2: rewrite each provider -----------------------------------
     max_index = max([r[5] for r in rows if r[5] is not None] or [0])
     new_routes = {}
     bridged = joined = 0
 
-    for pid, name, cfg_raw, meta_raw, in_queue, sort_index in rows:
+    for pid, name, cfg_raw, meta_raw, in_queue, sort_index, website_url in rows:
         cfg = json.loads(cfg_raw)
         conf = cfg.get("config") or ""
         match = BASE_URL_RE.search(conf)
@@ -151,21 +232,28 @@ def main():
         current = match.group(1)
 
         inherited_from = None
+        unverified = False
         if MARKER in current:
             mount_match = MOUNT_RE.search(current)
             src = mount_match.group(1) if mount_match else None
             if src and src != pid:
                 inherited_from = src
-                original = known.get(src)
-            else:
-                original = known.get(pid)
+            key = (cfg.get("auth") or {}).get("OPENAI_API_KEY") or ""
+            original, origin_source, verified = resolve_original(
+                pid, known, website_url, key)
+            unverified = bool(original) and not verified
         else:
-            original = current
+            original, origin_source, verified = current, "base_url", True
 
         if not original:
-            print("  skip %-40s (already bridged, real upstream unknown; "
-                  "set the relay URL in CC Switch once, then re-run)" % name[:40])
+            print("  skip %-40s (copied from %s, and this provider's own upstream "
+                  "is unknown;\n       set its relay URL in CC Switch once, or fill "
+                  "in website_url, then re-run)"
+                  % (name[:40], (inherited_from or "another provider")[:8]))
             continue
+        if unverified:
+            print("  WARN %-40s upstream from %s did not answer /models for this "
+                  "key; check it" % (name[:40], origin_source))
 
         original = original.rstrip("/")
         root = upstream_root(original)
@@ -210,10 +298,11 @@ def main():
             sort_index = max_index
             changed.append("sort_index")
 
-        conn.execute(
-            "UPDATE providers SET settings_config=?, meta=?, in_failover_queue=1, "
-            "sort_index=? WHERE id=? AND app_type='codex'",
-            (json.dumps(cfg, ensure_ascii=False), cfg_meta, sort_index, pid))
+        if not DRY_RUN:
+            conn.execute(
+                "UPDATE providers SET settings_config=?, meta=?, in_failover_queue=1, "
+                "sort_index=? WHERE id=? AND app_type='codex'",
+                (json.dumps(cfg, ensure_ascii=False), cfg_meta, sort_index, pid))
 
         new_routes[pid] = {
             "mount": mount,
@@ -229,7 +318,8 @@ def main():
         note = ""
         if inherited_from:
             src_name = next((r[1] for r in rows if r[0] == inherited_from), inherited_from)
-            note = "  (inherited mount from '%s', re-pointed)" % src_name
+            note = ("  (copied from '%s' - mount no longer reused; own upstream "
+                    "taken from %s)" % (src_name, origin_source))
         print("  P%-3s %-40s %s -> %s%s"
               % (sort_index, name[:40], original, new_url,
                  "  [" + ",".join(changed) + "]" if changed else "  [ok]"))
@@ -268,6 +358,12 @@ def main():
 
     # round-robin order == CC Switch's failover priority, official account last
     order = [r[0] for r in rows if r[0] in new_routes] + official_pids
+
+    if DRY_RUN:
+        print("\n[dry-run] routes.json / CC Switch not touched. Drop --dry-run to apply.")
+        print("would write %d route(s): %s"
+              % (len(new_routes), ", ".join(new_routes[p]["name"] for p in order)))
+        return
 
     with open(ROUTES_FILE, "w") as fh:
         json.dump({"port": PORT, "attempts": ATTEMPTS, "order": order,

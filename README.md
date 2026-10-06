@@ -55,6 +55,7 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
 
 ```bash
 git clone <本仓库> && cd codex-relay-toolkit
+python3 setup.py --dry-run         # 先看会改什么，不动数据库/路由文件
 python3 setup.py                 # 读取 CC Switch 数据库、生成 routes.json，
                                  # 并把每个供应商的 base_url 指到桥上
 # 可以先检查一下 routes.json，然后启动：
@@ -68,7 +69,20 @@ python3 bridge.py                # 前台运行；后台服务见 launchd/
 
 在 CC Switch 里**新增或复制**供应商之后，重新跑一次 `setup.py`。它是幂等的，
 并且会修复"复制陷阱"：**在界面里复制出来的供应商，会继承被复制者的桥地址**，
-不修的话副本会指向别人的路由。
+不修的话副本会指向别人的路由 —— 而且**只从桥地址是看不出它真正是谁的**。
+所以副本的真实地址按这个顺序确定：
+
+1. 该供应商自己记录过的原始 `base_url`（`originals.json`／上一轮的 route）；
+2. CC Switch 里这家供应商的 `website_url`（新增中转时填的官网地址）；
+3. 上面两个都没有 → **跳过并提示**，不会拿"被复制者的上游"顶替。
+
+候选地址还要用**这家供应商自己的 key** 去探一次 `/models`（`""` 和 `/v1` 都试），
+只看它是否真的应答；探不通会打印 `WARN` 但仍然入队（有些中转只是禁了 `/models`）。
+这套判断有回归测试：
+
+```bash
+python3 tests/test_setup_discovery.py    # 本地假中转 + 临时数据库，不碰网络
+```
 
 ```bash
 python3 restore.py               # 把原始 base_url 还原回去
@@ -92,6 +106,9 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXHAUST_STATUS` | `400` | 预算用尽时返回的状态码 |
 | `BRIDGE_OFFICIAL_ATTEMPTS` | `10` | 兜底账号的单请求次数上限 |
 | `BRIDGE_MODELS_TTL` | `1800` | 中转模型列表缓存秒数（自动适配模型用）|
+| `BRIDGE_PROBE_TIMEOUT` | `10` | `setup.py` 校验候选上游时等的秒数 |
+| `BRIDGE_DB` | `~/.cc-switch/cc-switch.db` | 换一个数据库（测试用）|
+| `BRIDGE_ROUTES` / `BRIDGE_ORIGINALS` | 脚本同目录 | 换 `routes.json` / `originals.json` 的路径（测试用）|
 
 > **一定要调文件描述符上限。** launchd 的默认软上限是 256，一个流式代理很快就会用尽 ——
 > 症状是**上层报 `connection failed`，而桥看起来一切正常**。
@@ -171,17 +188,44 @@ CC Switch 的成本统计靠它内置的 `model_pricing` 表算：查不到这�
 再把折算后的真实单价写回 `model_pricing`：
 
 ```bash
+python3 sync_usage.py --balance                # 余额查询：各中转真实余额 + 地址绑定检查
 python3 sync_usage.py                          # 只看各中转的折算系数
 python3 sync_usage.py --write-pricing          # 看折算后的单价
-python3 sync_usage.py --write-pricing --apply  # 写入（推荐）
+python3 sync_usage.py --write-pricing --apply  # 写入（推荐，会先备份旧单价）
 python3 sync_usage.py --field account_cost --write-pricing --apply   # 换字段
 ```
 
-实测各中转的系数在 **0.03 ~ 0.42** 之间（普遍打大折扣）。写完后同样一次请求的成本
+### 余额查询（`--balance`）
+
+```
+中转                       HTTP               余额 单位    planName     余额地址绑定
+哈吉米 特惠                200        29.9997246 USD   钱包余额         ok
+wdlink 福利                200       84.61191884 USD   钱包余额         ok
+```
+
+两件事一起查：
+
+* **余额**：用每个中转**自己的 key** 查它**自己的**地址（`upstream` + 该中转的
+  `prefix`，所以只有 `/v1` 的中转和只认站点根的中转都对）。
+* **地址绑定**：对比 CC Switch 里这家供应商的 `usage_script.baseUrl`。
+  复制出来的中转会把这个字段一起复制走 —— 于是界面上显示的是**别人家的余额**。
+  这一列会直接标 `错: https://…（应 https://…）`，跑一次 `setup.py` 就能对齐。
+  查不到余额的中转会把自己的 HTTP 状态和错误原因打出来，不再静默变成"没有数据"。
+
+### 真实价格查询
+
+每个中转的金额一律取它自己的 `/v1/usage`。第一次跑（对着 CC Switch 内置标价）时，
+实测各中转的系数在 **0.03 ~ 0.42** 之间（普遍打大折扣），同样一次请求的成本
 从 `$0.00958` 变成 `$0.00065`。
+
+> 系数是「中转报告的收费 ÷ **当前表里的**单价」。第一次折算完之后表里已经是真实单价，
+> 所以**再跑一次系数会趋近 `1.000`** —— 这是收敛，不是又打了折。之后每次跑只是把
+> 新出现的中转／新用法带进来的偏差修正回 1。
 
 > 踩过的坑：改 `providers.cost_multiplier`（`--apply` 的默认模式）**CC Switch 记账时并不采用**，
 > 记录里仍是 `1.0`，重启也不生效 —— 所以推荐用 `--write-pricing` 直接改单价。
+> 两种 `--apply` 都会先把旧值备份成 `model_pricing-bak-<时间>.json` /
+> `cost_multiplier-bak-<时间>.json`（已 git 忽略）。
 
 ---
 
