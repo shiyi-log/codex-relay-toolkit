@@ -119,7 +119,37 @@ python3 restore.py               # 把原始 base_url 还原回去
 
 ---
 
-## 二、会话看门狗（`watchdog.py`）
+## 二、自动跟随最新模型（`sync_model.py`）
+
+**不要把模型名写死。** 中转上新模型的速度不一样，写死一个版本意味着要么用旧的，
+要么每次手动改。
+
+`sync_model.py` 查询每个中转的 `/v1/models`，挑出**同一家族里版本最高、
+且被足够多中转支持**的那个模型，然后同时写进 `~/.codex/config.toml` 和
+CC Switch 里各供应商的配置。
+
+```bash
+python3 sync_model.py            # 只显示会选哪个，不改任何东西
+python3 sync_model.py --apply    # 真正写入（会先优雅停掉 CC Switch）
+```
+
+判断规则：
+
+* 家族默认 `sol`（`BRIDGE_MODEL_FAMILY` 可改）；不指定时沿用当前模型的家族
+* 版本按 `gpt-<大版本>[.<小版本>]-<家族>` 排序取最高
+* 支持率要求 `>= BRIDGE_MODEL_MIN_SUPPORT`（默认 `0.5`）。
+  **用「大多数」而不是「全部」**：个别中转会掉队（比如只有它没上 6.1），
+  不该让整个池子陪它退回旧版本
+* 一个模型都不支持的中转会被单独列出来 —— 它们只会白耗轮询次数
+
+> 注意：查询 `/models` 时会带一个常见的 `User-Agent`。有些中转会对
+> `Python-urllib/x.y` 直接回 403，导致模型列表被误判成"不支持"。
+
+模型对不上的中转建议移出队列，否则每次轮询到它都是 404。
+
+---
+
+## 三、会话看门狗（`watchdog.py`）
 
 Codex **本身就会**自动续跑带 `active` goal 的会话（goal 引擎的数据在
 `~/.codex/goals_1.sqlite`）。在一台繁忙机器上实测 48 小时：
