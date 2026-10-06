@@ -118,12 +118,14 @@ def log(msg):
 
 
 def log_request(mount, relay, model, attempt, status, seconds, result,
-                pid=None, tokens=None):
+                pid=None, tokens=None, stream_complete=None):
     """Append one structured request line (see BRIDGE_REQUEST_LOG).
 
     `tokens` comes from the relay's own `usage` block; `est_cost_usd` prices it
     with **that relay's measured $/weighted-M-token**, i.e. what this relay
     really charges - not the shared blended table CC Switch uses.
+    `stream_complete=False` means the client hung up mid-stream; then there is
+    no usage to report at all (the relay never sent it).
     """
     if not REQUEST_LOG:
         return
@@ -134,6 +136,8 @@ def log_request(mount, relay, model, attempt, status, seconds, result,
              "mount": mount, "relay": relay, "model": model, "attempt": attempt,
              "status": status, "result": result,
              "first_byte_ms": round(seconds * 1000) if seconds is not None else None}
+    if stream_complete is not None:
+        entry["stream_complete"] = stream_complete
     if tokens:
         entry["tokens"] = tokens
         entry["price_per_m"] = round(price, 5) if price else None
@@ -1063,6 +1067,8 @@ class Handler(BaseHTTPRequestHandler):
             log("CLIENT-GONE while sending %s: %s" % (status, exc))
 
     def _stream(self, status, headers, resp, head=b"", scanner=None):
+        """Relay a stream. Returns True if the upstream stream ended normally,
+        False if the client went away first (then there is no final usage)."""
         try:
             self.send_response(status)
             for key, value in headers:
@@ -1083,9 +1089,11 @@ class Handler(BaseHTTPRequestHandler):
                 if scanner:
                     scanner.feed(chunk)
             self.wfile.write(b"0\r\n\r\n")
+            return True
         except OSError as exc:
             self.close_connection = True
             log("CLIENT-GONE / upstream cut mid-stream: %s" % exc)
+            return False
 
     def _status(self, split):
         """GET /__bridge/status[?model=...][&text=1] - the live ranking."""
@@ -1281,9 +1289,10 @@ class Handler(BaseHTTPRequestHandler):
                             % (method, split.path, status, route["name"], done,
                                attempts, wanted or "?"))
                         scanner = UsageScanner()
-                        self._stream(status, raw_headers, resp, head, scanner)
+                        complete = self._stream(status, raw_headers, resp, head, scanner)
                         log_request(mount_name, route["name"], wanted, done, status,
-                                    ttfb, "ok", pid=pid, tokens=scanner.tokens())
+                                    ttfb, "ok", pid=pid, tokens=scanner.tokens(),
+                                    stream_complete=complete)
                         conn.close()
                         return
 

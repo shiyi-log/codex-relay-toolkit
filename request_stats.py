@@ -125,12 +125,17 @@ def main():
 
     tok = [r for r in served if r.get("tokens")]
     if tok:
+        no_usage = [r for r in served if not r.get("tokens")]
+        cut = [r for r in no_usage if r.get("stream_complete") is False]
         tot_wm = sum(weighted_million(r["tokens"]) for r in tok)
         tot_cost = sum(r.get("est_cost_usd") or 0 for r in tok)
         raw_in = sum(r["tokens"].get("input", 0) for r in tok)
         raw_cr = sum(r["tokens"].get("cache_read", 0) for r in tok)
         raw_out = sum(r["tokens"].get("output", 0) for r in tok)
         print("用量与花费（有 usage 的 %d/%d 个请求）" % (len(tok), len(served)))
+        if no_usage:
+            print("  没有 usage 的 %d 个里，%d 个是客户端中途断开（stream_complete=false，"
+                  "中转根本没发 completed/usage）" % (len(no_usage), len(cut)))
         print("  未缓存输入 %-12d 输出 %-10d 缓存读取 %-12d 缓存命中率 %.0f%%"
               % (raw_in, raw_out, raw_cr, 100.0 * raw_cr / max(1, raw_in + raw_cr)))
         print("  加权百万 token: %.3f   估算总花费: $%.5f   平均 $%.4f/加权M"

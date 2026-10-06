@@ -191,6 +191,7 @@ class RetryLoopTest(unittest.TestCase):
                                                    "cache_creation": 0, "total": 1010})
             self.assertAlmostEqual(lines[-1]["price_per_m"], 0.5, places=4)
             self.assertAlmostEqual(lines[-1]["est_cost_usd"], 320e-6 * 0.5, places=8)
+            self.assertTrue(lines[-1]["stream_complete"])
             # retry lines carry no usage
             self.assertNotIn("tokens", lines[0])
         finally:
