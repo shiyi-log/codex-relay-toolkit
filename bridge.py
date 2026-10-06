@@ -118,7 +118,8 @@ def log(msg):
 
 
 def log_request(mount, relay, model, attempt, status, seconds, result,
-                pid=None, tokens=None, stream_complete=None):
+                pid=None, tokens=None, stream_complete=None, response_id=None,
+                mount_id=None, relay_id=None):
     """Append one structured request line (see BRIDGE_REQUEST_LOG).
 
     `tokens` comes from the relay's own `usage` block; `est_cost_usd` prices it
@@ -126,6 +127,8 @@ def log_request(mount, relay, model, attempt, status, seconds, result,
     really charges - not the shared blended table CC Switch uses.
     `stream_complete=False` means the client hung up mid-stream; then there is
     no usage to report at all (the relay never sent it).
+    `response_id` + `relay_id` let relay_attrib.py point CC Switch's request-log
+    row at the relay that really served it.
     """
     if not REQUEST_LOG:
         return
@@ -136,6 +139,12 @@ def log_request(mount, relay, model, attempt, status, seconds, result,
              "mount": mount, "relay": relay, "model": model, "attempt": attempt,
              "status": status, "result": result,
              "first_byte_ms": round(seconds * 1000) if seconds is not None else None}
+    if mount_id:
+        entry["mount_id"] = mount_id
+    if relay_id:
+        entry["relay_id"] = relay_id
+    if response_id:
+        entry["response_id"] = response_id
     if stream_complete is not None:
         entry["stream_complete"] = stream_complete
     if tokens:
@@ -173,11 +182,20 @@ class UsageScanner:
         self.buf = ""
         self.limit = limit
         self.usage = None
+        # the relay's response id: CC Switch names its request-log row
+        # "session:codex:<provider>:<resp_id>", so this is what lets the
+        # attributor rewrite that row's provider to the relay that really served
+        self.response_id = None
+        self._tail = ""
 
     def feed(self, chunk):
         if not chunk:
             return
-        self.buf += chunk.decode("utf-8", "replace")
+        text = chunk.decode("utf-8", "replace")
+        for m in re.finditer(r'"id":"(resp_[A-Za-z0-9]+)"', self._tail + text):
+            self.response_id = m.group(1)
+        self._tail = (self._tail + text)[-200:]
+        self.buf += text
         if len(self.buf) > self.limit:
             self.buf = self.buf[-self.limit:]
         while True:
@@ -1278,7 +1296,7 @@ class Handler(BaseHTTPRequestHandler):
                         netfails += 1
                         record_attempt(pid, failed=True)
                         log_request(mount_name, route["name"], wanted, done, 200, None,
-                                    "stalled")
+                                    "stalled", mount_id=start_pid, relay_id=pid)
                         conn.close()
                         conn = None
                     else:
@@ -1292,7 +1310,9 @@ class Handler(BaseHTTPRequestHandler):
                         complete = self._stream(status, raw_headers, resp, head, scanner)
                         log_request(mount_name, route["name"], wanted, done, status,
                                     ttfb, "ok", pid=pid, tokens=scanner.tokens(),
-                                    stream_complete=complete)
+                                    stream_complete=complete,
+                                    response_id=scanner.response_id,
+                                    mount_id=start_pid, relay_id=pid)
                         conn.close()
                         return
 
@@ -1305,16 +1325,21 @@ class Handler(BaseHTTPRequestHandler):
                 if not retryable:
                     seconds = None
                     tokens = None
+                    response_id = None
                     if status == 200:
                         seconds = time.time() - attempt_started
                         record_attempt(pid, seconds)
                         try:
-                            tokens = normalise_usage(
-                                (json.loads(body.decode("utf-8")) or {}).get("usage"))
+                            payload = json.loads(body.decode("utf-8")) or {}
+                            tokens = normalise_usage(payload.get("usage"))
+                            rid = payload.get("id")
+                            response_id = rid if isinstance(rid, str) else None
                         except Exception:
                             tokens = None
                     log_request(mount_name, route["name"], wanted, done, status,
-                                seconds, "pass", pid=pid, tokens=tokens)
+                                seconds, "pass", pid=pid, tokens=tokens,
+                                response_id=response_id, mount_id=start_pid,
+                                relay_id=pid)
                     log("PASS  %s %s -> %s via %s (attempt %d) model=%s"
                         % (method, split.path, status, route["name"], done,
                            wanted or "?"))
@@ -1323,7 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 record_attempt(pid, failed=True)
                 log_request(mount_name, route["name"], wanted, done, status, None,
-                            "retry")
+                            "retry", mount_id=start_pid, relay_id=pid)
                 last = {"status": status, "headers": raw_headers, "body": body}
                 netfails = 0
                 snippet = body[:120].decode("utf-8", "replace").replace("\n", " ")
@@ -1333,7 +1358,7 @@ class Handler(BaseHTTPRequestHandler):
             except (socket.timeout, OSError) as exc:
                 record_attempt(pid, failed=True)
                 log_request(mount_name, route["name"], wanted, done, None, None,
-                            "network-error")
+                            "network-error", mount_id=start_pid, relay_id=pid)
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {
@@ -1345,7 +1370,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:                                   # pragma: no cover
                 record_attempt(pid, failed=True)
                 log_request(mount_name, route["name"], wanted, done, None, None,
-                            "error")
+                            "error", mount_id=start_pid, relay_id=pid)
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {

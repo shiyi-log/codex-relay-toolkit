@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs relay_attrib.py every 30s so CC Switch's request log shows the relay that
+  really served each request. Install:
+
+    cp com.local.relay-attrib.plist.example ~/Library/LaunchAgents/com.local.relay-attrib.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.relay-attrib.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.relay-attrib</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/REPLACE_ME/.ccswitch-retry-bridge/relay_attrib.py</string>
+    <string>--once</string>
+    <string>--quiet</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/REPLACE_ME/.ccswitch-retry-bridge</string>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_ME/.ccswitch-retry-bridge/relay-attrib.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_ME/.ccswitch-retry-bridge/relay-attrib.err.log</string>
+</dict>
+</plist>

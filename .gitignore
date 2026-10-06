@@ -29,3 +29,6 @@ __pycache__/
 .vscode/
 bridge-requests.jsonl
 bridge-requests.jsonl.1
+attribution-state.json
+attribution-changelog.jsonl
+attribution-changelog.jsonl.rolled-back

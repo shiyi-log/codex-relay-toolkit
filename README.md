@@ -177,6 +177,37 @@ wdlink plus                 90      74      16     6070ms      0.000      0.0000
 **②才是"动态排序起作用"的证据**：请求在**第一次尝试**就发给了别家，不可能由失败触发。
 ③才是失败重连。
 
+### 让 CC Switch 的请求日志显示真实中转（`relay_attrib.py`）
+
+CC Switch 的「请求日志 / Provider 统计 / 模型统计」记的是**它把请求发给了谁**（桥的入口），
+所以永远只有一家。但它那行的主键里带着中转返回的 response id：
+
+```
+request_id = session:codex:<它发去的 provider>:resp_xxxxxxxx
+```
+
+桥的 `bridge-requests.jsonl` 里既有 `response_id` 又有真正服务那家的 `relay_id`，
+于是可以**精确到行**把归属改成真实值：
+
+```bash
+python3 relay_attrib.py --once            # 处理新请求
+python3 relay_attrib.py --once --dry-run  # 只看会改什么
+python3 relay_attrib.py --status          # 进度 / 已改多少行
+python3 relay_attrib.py --rollback        # 按变更记录一键还原
+```
+
+后台常驻（每 30 秒一次）见 `launchd/com.local.relay-attrib.plist.example`。
+
+规则与边界：
+
+* **只改归属数据**（`proxy_request_logs.provider_id`），不动路由、不动金额、
+  不碰 `data_source='codex_session'` 的会话同步行。
+* 匹配靠 response id，**不会张冠李戴**；CC Switch 落库比响应晚一点，
+  一时找不到的行会进重试队列（默认 15 分钟）而不是丢掉。
+* 每次修改都追加到 `attribution-changelog.jsonl`，`--rollback` 按它还原。
+* 只修正**桥重启之后**的请求（更早的行没记 response id，保持原样）。
+* 幂等：重复跑不会重复改。
+
 ### 安装
 
 ```bash
