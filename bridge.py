@@ -37,6 +37,7 @@ import base64
 import json
 import os
 import random
+import re
 import socket
 import sys
 import threading
@@ -44,6 +45,7 @@ import time
 from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROUTES_FILE = os.environ.get("BRIDGE_ROUTES", os.path.join(BASE_DIR, "routes.json"))
@@ -216,6 +218,79 @@ def normalize_for_official(body):
                           "content": [{"type": "input_text", "text": inp}]}]
         return json.dumps(data, ensure_ascii=False).encode("utf-8")
     return body
+
+
+# ------------------------------------------------------------- model adaptation
+# Relays do not all carry the same model versions. Rather than failing a request
+# with 404 on a relay that is one version behind, look up what that relay
+# actually serves and swap in the newest model of the same family. The client
+# keeps asking for whatever it wants; the bridge fits each relay.
+_models_cache = {}
+_models_lock = threading.Lock()
+MODEL_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?-([A-Za-z0-9.]+)$")
+MODELS_TTL = float(os.environ.get("BRIDGE_MODELS_TTL", "1800"))
+
+
+def route_models(pid, route):
+    """Cached /v1/models for one relay. Empty set means 'unknown'."""
+    if route.get("auth_type") == "oauth":
+        return set()
+    now = time.time()
+    with _models_lock:
+        ent = _models_cache.get(pid)
+        if ent and now - ent["ts"] < MODELS_TTL:
+            return ent["ids"]
+    ids = set()
+    try:
+        req = urllib.request.Request(
+            route["upstream"] + route["prefix"] + "/models",
+            headers={"Authorization": "Bearer " + (route.get("auth") or ""),
+                     # some relays answer 403 to the default python-urllib UA
+                     "User-Agent": "curl/8.7.1", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as fh:
+            ids = {m.get("id") for m in (json.load(fh).get("data") or []) if m.get("id")}
+    except Exception as exc:
+        log("MODELS %s unavailable (%s) - skipping adaptation" % (route["name"], exc))
+    with _models_lock:
+        _models_cache[pid] = {"ids": ids, "ts": now}
+    return ids
+
+
+def adapt_model(body, pid, route):
+    """Swap the requested model for the newest one this relay does serve."""
+    if not body or route.get("auth_type") == "oauth":
+        return body
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return body
+    if not isinstance(data, dict):
+        return body
+    wanted = data.get("model")
+    if not isinstance(wanted, str) or not wanted:
+        return body
+
+    ids = route_models(pid, route)
+    if not ids or wanted in ids:
+        return body                      # unknown list, or nothing to do
+
+    m = MODEL_RE.match(wanted)
+    if not m:
+        return body
+    family = m.group(3)
+    cands = []
+    for mid in ids:
+        p = MODEL_RE.match(mid)
+        if p and p.group(3) == family:
+            cands.append((int(p.group(1)), int(p.group(2) or 0), mid))
+    if not cands:
+        return body                      # relay has none of this family at all
+    cands.sort(reverse=True)
+    best = cands[0][2]
+    data["model"] = best
+    log("ADAPT %s: %s -> %s (this relay does not serve %s)"
+        % (route["name"], wanted, best, wanted))
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 # ----------------------------------------------------------------------- upstream
@@ -413,8 +488,11 @@ class Handler(BaseHTTPRequestHandler):
             attempt_body = request_body
             if route.get("auth_type") == "oauth":
                 attempt_body = normalize_for_official(request_body)
-                if attempt_body is not request_body:
-                    headers["Content-Length"] = str(len(attempt_body))
+            else:
+                # fit the model to what this relay actually serves
+                attempt_body = adapt_model(request_body, pid, route)
+            if attempt_body is not request_body:
+                headers["Content-Length"] = str(len(attempt_body))
 
             conn = None
             try:
