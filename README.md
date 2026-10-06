@@ -127,6 +127,38 @@ wdlink  deepseek4.1        ──  查询不到用量（key 已失效）
 * 只在**本机**可访问（非回环地址直接 403）。
 * 每次排序变化会在 `bridge.log` 里留一行 `ORDER ...`，方便回看它为什么这么选。
 
+### 看清楚「这一次到底是谁服务的」
+
+CC Switch 的请求日志只会记 **它把请求发给了谁**——也就是它选中那家 = 桥的入口。
+桥在内部换成别家，它完全不知道（这是"动态排序"的必然结果，不是 bug）。
+所以要看清真相得看桥自己的逐请求日志：
+
+```bash
+tail -f ~/.ccswitch-retry-bridge/bridge-requests.jsonl
+{"ts":"2026-10-07 03:31:40","mount":"pp 特惠","relay":"pp 特惠","model":"gpt-6-sol",
+ "attempt":1,"status":200,"result":"ok","first_byte_ms":3946}
+```
+
+`mount` = CC Switch 发给了谁，`relay` = 桥实际用了谁，`attempt` = 第几次尝试，
+`result` = `ok`/`pass`/`retry`/`stalled`/`network-error`。文件到 5MB 自动轮转成 `.1`；
+`BRIDGE_REQUEST_LOG=0` 可关闭。`bridge.log` 的每行现在也带 `model=`。
+
+**「主动动态调整」还是「失败重连」？** 用脚本一句话分清：
+
+```bash
+python3 request_stats.py                 # 默认读 ~/.ccswitch-retry-bridge
+python3 request_stats.py --minutes 30
+```
+
+```
+① attempt=1 且 relay == mount  :   540  ( 58%)  入口那家就是第一名，没换
+② attempt=1 且 relay != mount  :   352  ( 38%)  ★主动切换：前面没有任何失败
+③ attempt >= 2                 :    45  (  5%)  失败重连（真正的 failover）
+```
+
+**②才是"动态排序起作用"的证据**：请求在**第一次尝试**就发给了别家，不可能由失败触发。
+③才是失败重连。
+
 ### 安装
 
 ```bash
@@ -201,6 +233,7 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
 | `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
 | `BRIDGE_STATE` | `<脚本目录>/bridge-state.json` | 学到的排序数据（**不要**用 watchdog 的 `state.json`）|
+| `BRIDGE_REQUEST_LOG` | `<脚本目录>/bridge-requests.jsonl` | 逐请求日志（mount/relay/model/attempt/首字节）；`0` = 关闭 |
 | `BRIDGE_HOUSEKEEPING` | `30` | 后台线程轮询间隔（刷新价格、落盘状态）|
 | `BRIDGE_PROBE_TIMEOUT` | `10` | `setup.py` 校验候选上游时等的秒数 |
 | `BRIDGE_DB` | `~/.cc-switch/cc-switch.db` | 换一个数据库（测试用）|

@@ -57,6 +57,14 @@ import urllib.request
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROUTES_FILE = os.environ.get("BRIDGE_ROUTES", os.path.join(BASE_DIR, "routes.json"))
 LOG_FILE = os.environ.get("BRIDGE_LOG", os.path.join(BASE_DIR, "bridge.log"))
+# One JSON line per attempt: which provider CC Switch sent to, which relay the
+# bridge actually used, model, attempt, status, first byte. CC Switch can only
+# record the provider it *sent* to, so this file is the only per-request record
+# of the real relay. Set to 0/off/empty to disable.
+REQUEST_LOG = os.environ.get("BRIDGE_REQUEST_LOG",
+                             os.path.join(BASE_DIR, "bridge-requests.jsonl"))
+if REQUEST_LOG.strip().lower() in ("0", "off", "none", "no"):
+    REQUEST_LOG = ""
 
 DEFAULT_ATTEMPTS = int(os.environ.get("BRIDGE_ATTEMPTS", "100"))
 MAX_SECONDS = float(os.environ.get("BRIDGE_MAX_SECONDS", "300"))   # 0 = no wall-clock cap
@@ -105,6 +113,24 @@ def log(msg):
                 os.replace(LOG_FILE, LOG_FILE + ".1")
             with open(LOG_FILE, "a") as fh:
                 fh.write(line)
+    except Exception:
+        pass
+
+
+def log_request(mount, relay, model, attempt, status, seconds, result):
+    """Append one structured request line (see BRIDGE_REQUEST_LOG)."""
+    if not REQUEST_LOG:
+        return
+    entry = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "epoch": round(time.time(), 3),
+             "mount": mount, "relay": relay, "model": model, "attempt": attempt,
+             "status": status, "result": result,
+             "first_byte_ms": round(seconds * 1000) if seconds is not None else None}
+    try:
+        with _log_lock:
+            if os.path.exists(REQUEST_LOG) and os.path.getsize(REQUEST_LOG) > 5 * 1024 * 1024:
+                os.replace(REQUEST_LOG, REQUEST_LOG + ".1")
+            with open(REQUEST_LOG, "a") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -1061,6 +1087,7 @@ class Handler(BaseHTTPRequestHandler):
         ordered, scores = plan_order(routes, base_order, start_pid, wanted,
                                      explore=explore)
         log_plan(ordered, scores, wanted)
+        mount_name = (routes.get(start_pid) or {}).get("name") or start_pid
 
         start_time = time.time()
         last = {"status": None, "headers": [("Content-Type", "application/json")], "body": b""}
@@ -1149,13 +1176,19 @@ class Handler(BaseHTTPRequestHandler):
                                     "type": "upstream_error"}}).encode()}
                         netfails += 1
                         record_attempt(pid, failed=True)
+                        log_request(mount_name, route["name"], wanted, done, 200, None,
+                                    "stalled")
                         conn.close()
                         conn = None
                     else:
                         # first byte is what "faster to call" really means here
-                        record_attempt(pid, time.time() - attempt_started)
-                        log("OK    %s %s -> %s via %s (attempt %d/%d)"
-                            % (method, split.path, status, route["name"], done, attempts))
+                        ttfb = time.time() - attempt_started
+                        record_attempt(pid, ttfb)
+                        log_request(mount_name, route["name"], wanted, done, status,
+                                    ttfb, "ok")
+                        log("OK    %s %s -> %s via %s (attempt %d/%d) model=%s"
+                            % (method, split.path, status, route["name"], done,
+                               attempts, wanted or "?"))
                         self._stream(status, raw_headers, resp, head)
                         conn.close()
                         return
@@ -1167,21 +1200,31 @@ class Handler(BaseHTTPRequestHandler):
                 retryable = status in RETRY_STATUS or is_retryable_body(body)
 
                 if not retryable:
+                    seconds = None
                     if status == 200:
-                        record_attempt(pid, time.time() - attempt_started)
-                    log("PASS  %s %s -> %s via %s (attempt %d)"
-                        % (method, split.path, status, route["name"], done))
+                        seconds = time.time() - attempt_started
+                        record_attempt(pid, seconds)
+                    log_request(mount_name, route["name"], wanted, done, status,
+                                seconds, "pass")
+                    log("PASS  %s %s -> %s via %s (attempt %d) model=%s"
+                        % (method, split.path, status, route["name"], done,
+                           wanted or "?"))
                     self._send(status, raw_headers, body)
                     return
 
                 record_attempt(pid, failed=True)
+                log_request(mount_name, route["name"], wanted, done, status, None,
+                            "retry")
                 last = {"status": status, "headers": raw_headers, "body": body}
                 netfails = 0
                 snippet = body[:120].decode("utf-8", "replace").replace("\n", " ")
-                log("RETRY %s %s -> %s via %s (attempt %d/%d) %s"
-                    % (method, split.path, status, route["name"], done, attempts, snippet))
+                log("RETRY %s %s -> %s via %s (attempt %d/%d) model=%s %s"
+                    % (method, split.path, status, route["name"], done, attempts,
+                       wanted or "?", snippet))
             except (socket.timeout, OSError) as exc:
                 record_attempt(pid, failed=True)
+                log_request(mount_name, route["name"], wanted, done, None, None,
+                            "network-error")
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {
@@ -1192,6 +1235,8 @@ class Handler(BaseHTTPRequestHandler):
                     % (method, split.path, route["name"], done, attempts, netfails, exc))
             except Exception as exc:                                   # pragma: no cover
                 record_attempt(pid, failed=True)
+                log_request(mount_name, route["name"], wanted, done, None, None,
+                            "error")
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {

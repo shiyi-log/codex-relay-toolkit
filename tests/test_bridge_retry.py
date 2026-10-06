@@ -108,6 +108,7 @@ class RetryLoopTest(unittest.TestCase):
         env = dict(os.environ, BRIDGE_ROUTES=routes_path, BRIDGE_PORT=str(port),
                    BRIDGE_STATE=os.path.join(tmp, "state.json"),
                    BRIDGE_LOG=os.path.join(tmp, "bridge.log"),
+                   BRIDGE_REQUEST_LOG=os.path.join(tmp, "requests.jsonl"),
                    BRIDGE_PRICE_TTL="600", BRIDGE_VERBOSE="0",
                    BRIDGE_ORDER_MODE="fixed", BRIDGE_BACKOFF="0.01")
         if exhaust_status is not None:
@@ -126,7 +127,7 @@ class RetryLoopTest(unittest.TestCase):
         else:
             proc.kill()
             self.fail("bridge did not start")
-        return proc, port
+        return proc, port, tmp
 
     def post(self, port):
         req = urllib.request.Request(
@@ -138,12 +139,24 @@ class RetryLoopTest(unittest.TestCase):
 
     def test_400_upstream_error_is_retried_and_stream_kept(self):
         relay = FlakyRelay(fail_first=2)
-        proc, port = self.start_bridge(relay, attempts=5)
+        proc, port, tmp = self.start_bridge(relay, attempts=5)
         try:
             status, body = self.post(port)
             self.assertEqual(status, 200)
             self.assertIn(b"response.completed", body)   # intact stream, not truncated
             self.assertEqual(relay.hits, 3)
+
+            # the structured request log is the only per-request record of which
+            # relay really served it (CC Switch can only see the mount)
+            with open(os.path.join(tmp, "requests.jsonl")) as fh:
+                lines = [json.loads(l) for l in fh if l.strip()]
+            self.assertEqual([l["result"] for l in lines],
+                             ["retry", "retry", "ok"])
+            self.assertEqual(lines[-1]["relay"], "flaky")
+            self.assertEqual(lines[-1]["mount"], "flaky")
+            self.assertEqual(lines[-1]["model"], MODEL)
+            self.assertEqual(lines[-1]["attempt"], 3)
+            self.assertIsNotNone(lines[-1]["first_byte_ms"])
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -151,7 +164,7 @@ class RetryLoopTest(unittest.TestCase):
 
     def test_budget_is_bounded_and_exhaust_status_is_returned(self):
         relay = FlakyRelay(fail_first=10_000)
-        proc, port = self.start_bridge(relay, attempts=3, exhaust_status=400)
+        proc, port, tmp = self.start_bridge(relay, attempts=3, exhaust_status=400)
         try:
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 self.post(port)
@@ -159,6 +172,8 @@ class RetryLoopTest(unittest.TestCase):
             payload = json.loads(ctx.exception.read())
             self.assertIn("error", payload)
             self.assertEqual(relay.hits, 3)              # exactly the budget
+            with open(os.path.join(tmp, "requests.jsonl")) as fh:
+                self.assertEqual(len([l for l in fh if l.strip()]), 3)
         finally:
             proc.terminate()
             proc.wait(timeout=5)
