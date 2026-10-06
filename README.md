@@ -91,6 +91,7 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_BACKLOG` | `256` | listen backlog（标准库默认只有 5，会丢连接）|
 | `BRIDGE_EXHAUST_STATUS` | `400` | 预算用尽时返回的状态码 |
 | `BRIDGE_OFFICIAL_ATTEMPTS` | `10` | 兜底账号的单请求次数上限 |
+| `BRIDGE_MODELS_TTL` | `1800` | 中转模型列表缓存秒数（自动适配模型用）|
 
 > **一定要调文件描述符上限。** launchd 的默认软上限是 256，一个流式代理很快就会用尽 ——
 > 症状是**上层报 `connection failed`，而桥看起来一切正常**。
