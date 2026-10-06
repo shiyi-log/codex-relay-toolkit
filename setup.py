@@ -61,13 +61,18 @@ def upstream_root(url):
 
 
 def normalize_client_config(conf):
-    """Make the client config look like an official ChatGPT login.
+    """Give every relay provider the same client flavour.
 
-    Every relay provider gets the same flavour, so it does not matter which one
-    CC Switch currently has selected (its failover switches between them):
+    Uniform across providers so it does not matter which one CC Switch has
+    selected (its failover switches between them):
 
       name                  -> "OpenAI"      (what the UI shows)
-      requires_openai_auth  -> true          (use auth.json's ChatGPT login)
+      requires_openai_auth  -> BRIDGE_REQUIRE_OPENAI_AUTH (default false)
+                               false = log in with the relay's API key
+                                       (`codex login --with-api-key`), the right
+                                       choice when the ChatGPT account is out of
+                                       quota or unavailable
+                               true  = use auth.json's ChatGPT OAuth login
       supports_websockets   -> false         (the proxy/bridge only speaks HTTP)
       http_headers          -> removed       (the bridge re-signs per relay)
       thread_context        -> removed       (deprecated, Codex warns about it)
@@ -75,6 +80,7 @@ def normalize_client_config(conf):
     The endpoint (base_url) still points at the proxy/bridge, so inference keeps
     going to the relays.
     """
+    require_oauth = os.environ.get("BRIDGE_REQUIRE_OPENAI_AUTH", "0") == "1"
     out = []
     in_provider = False
     for line in conf.splitlines():
@@ -93,7 +99,8 @@ def normalize_client_config(conf):
             if stripped.startswith("wire_api"):
                 out.append(line)
                 out.append("supports_websockets = false")
-                out.append("requires_openai_auth = true")
+                out.append("requires_openai_auth = %s"
+                           % ("true" if require_oauth else "false"))
                 continue
         out.append(line)
     return "\n".join(out).rstrip("\n") + "\n"

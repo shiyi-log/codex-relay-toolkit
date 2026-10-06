@@ -155,7 +155,37 @@ python3 sync_model.py --apply    # 真正写入（会先优雅停掉 CC Switch�
 
 ---
 
-## 三、会话看门狗（`watchdog.py`）
+## 三、真实计费同步（`sync_usage.py`）
+
+CC Switch 的成本统计靠它内置的 `model_pricing` 表算：查不到这个模型就记 0，
+界面显示"未定价"（日志 `[USG-002] 模型定价未找到`）。而中转站其实**自己就报了真实费用** ——
+大多数 one-api / new-api 系中转的 `GET /v1/usage` 里，`model_stats[]` 每个模型都带：
+
+| 字段 | 含义 |
+|---|---|
+| `cost` | 按标价算 |
+| `actual_cost` | **实际计费**（你被收的钱） |
+| `account_cost` | 账户扣费 |
+
+`sync_usage.py` 把这些数字汇总，按 token 量加权算出「中转实际收费 / 标价」的系数，
+再把折算后的真实单价写回 `model_pricing`：
+
+```bash
+python3 sync_usage.py                          # 只看各中转的折算系数
+python3 sync_usage.py --write-pricing          # 看折算后的单价
+python3 sync_usage.py --write-pricing --apply  # 写入（推荐）
+python3 sync_usage.py --field account_cost --write-pricing --apply   # 换字段
+```
+
+实测各中转的系数在 **0.03 ~ 0.42** 之间（普遍打大折扣）。写完后同样一次请求的成本
+从 `$0.00958` 变成 `$0.00065`。
+
+> 踩过的坑：改 `providers.cost_multiplier`（`--apply` 的默认模式）**CC Switch 记账时并不采用**，
+> 记录里仍是 `1.0`，重启也不生效 —— 所以推荐用 `--write-pricing` 直接改单价。
+
+---
+
+## 四、会话看门狗（`watchdog.py`）
 
 Codex **本身就会**自动续跑带 `active` goal 的会话（goal 引擎的数据在
 `~/.codex/goals_1.sqlite`）。在一台繁忙机器上实测 48 小时：
