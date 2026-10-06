@@ -14,6 +14,9 @@
 `bridge.py` 补上这两个缺口。`watchdog.py` 与网络无关：它负责把**异常结束、
 且 Codex 自带 goal 引擎没有接管**的会话续跑起来。
 
+> 与 `codex-relay` / `model-hotel` / `codex-proxy` / `LiteLLM` 等项目的逐项对标、
+> 借鉴了什么、明确不抄什么、下一步做什么：见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
 ```
 Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
    （或 ────────────────────► 重试桥）   中转 B
@@ -208,6 +211,35 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
 * 只修正**桥重启之后**的请求（更早的行没记 response id，保持原样）。
 * 幂等：重复跑不会重复改。
 
+### 熔断与流式健康
+
+价格和延迟是"平时谁更好"，但**刚出过事的中转必须先歇着**。这一层借鉴自
+[model-hotel](https://github.com/hugalafutro/model-hotel)、
+[codex-proxy](https://github.com/thezillo/codex-proxy) 和
+[LiteLLM](https://github.com/BerriAI/litellm)：
+
+* **熔断器**：连续 `BRIDGE_BREAKER_THRESHOLD`（默认 5）次失败 → 开路并冷却
+  `BRIDGE_BREAKER_COOLDOWN`（60s）；冷却结束后的第一次真实请求就是**半开探针**，
+  探针再失败则冷却翻倍（上限 `BRIDGE_BREAKER_COOLDOWN_MAX`，15 分钟）。
+  开路的中转在排序里被压到队尾（不是移除，全部开路时仍会试）。
+* **按错误类别区别对待**：`auth`（key 失效/无权限）直接 park 1 小时；
+  `quota`（`usage_limit_reached`、余额不足…）park 到它给的**重置时间**（60s ~ 8 天），
+  且**只延长不缩短**；普通 `rate_limit` 尊重 `Retry-After`（上限 60s）但不急着开路；
+  `server`/`timeout`/`transport` 按连续次数累计。**请求级 400 与 404 不记熔断**，
+  免得冤枉健康的中转。
+* **等到内容才算落定**：以前读到一个字节就提交，而 `response.created` 这类记账事件也算；
+  中转接了请求却不吐内容时客户端就干等。现在**等到第一个内容帧**
+  （输出文本/推理/工具参数/`output_item.added`）才提交 —— 在那之前都还能换下一家。
+* **流中断看门狗**：提交之后已经无法换家，所以一旦 `BRIDGE_STREAM_STALL`（默认 45s，
+  收到 50 个 chunk 后放宽 ×3）没有任何字节，桥会补一个规范的
+  `event: response.failed`（`code: stream_stalled`）再收尾 —— 客户端拿到可处理的错误，
+  而不是一条被悄悄截断的流。
+* 每次尝试的错误类别与熔断判定都写进请求日志（`error_kind` / `breaker`），
+  `/__bridge/status` 也会显示每个中转的熔断状态与原因。
+
+> 顺带修掉一个真 bug：桥原来用 `HTTPResponse.read(n)` 转发流，它会**阻塞到攒满 n 字节**，
+> 等于把 SSE 按 8KB 批量转发；改成 `read1(n)` 后每个上游 chunk 立即转发。
+
 ### 安装
 
 ```bash
@@ -281,6 +313,15 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXPLORE_PRICE_FACTOR` | `2.0` | 探索只挑「最便宜的几倍」以内的中转（`0` = 不限价格）|
 | `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
 | `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
+| `BRIDGE_BREAKER_THRESHOLD` | `5` | 连续失败多少次开路 |
+| `BRIDGE_BREAKER_COOLDOWN` | `60` | 基础冷却秒数（失败探针翻倍）|
+| `BRIDGE_BREAKER_COOLDOWN_MAX` | `900` | 冷却上限 |
+| `BRIDGE_BREAKER_AUTH_COOLDOWN` | `3600` | key 失效时的 park 时长 |
+| `BRIDGE_BREAKER_QUOTA_MIN` / `_MAX` | `600` / `691200` | 配额 park 的钳制区间（10 分钟 ~ 8 天）|
+| `BRIDGE_RETRY_AFTER_MAX` | `60` | 尊重 `Retry-After` 的上限 |
+| `BRIDGE_TTFT_BUFFER_MAX` | `524288` | 等首个内容帧时最多缓冲的字节 |
+| `BRIDGE_STREAM_STALL` | `45` | 流中无字节多久算停滞 |
+| `BRIDGE_STREAM_STALL_MULT` / `_AFTER` | `3` / `50` | 收到这么多 chunk 后停滞阈值放宽的倍数 |
 | `BRIDGE_STATE` | `<脚本目录>/bridge-state.json` | 学到的排序数据（**不要**用 watchdog 的 `state.json`）|
 | `BRIDGE_REQUEST_LOG` | `<脚本目录>/bridge-requests.jsonl` | 逐请求日志（mount/relay/model/attempt/首字节）；`0` = 关闭 |
 | `BRIDGE_HOUSEKEEPING` | `30` | 后台线程轮询间隔（刷新价格、落盘状态）|

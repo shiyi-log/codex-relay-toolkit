@@ -119,7 +119,7 @@ def log(msg):
 
 def log_request(mount, relay, model, attempt, status, seconds, result,
                 pid=None, tokens=None, stream_complete=None, response_id=None,
-                mount_id=None, relay_id=None):
+                mount_id=None, relay_id=None, error_kind=None, breaker=None):
     """Append one structured request line (see BRIDGE_REQUEST_LOG).
 
     `tokens` comes from the relay's own `usage` block; `est_cost_usd` prices it
@@ -145,6 +145,10 @@ def log_request(mount, relay, model, attempt, status, seconds, result,
         entry["relay_id"] = relay_id
     if response_id:
         entry["response_id"] = response_id
+    if error_kind:
+        entry["error_kind"] = error_kind
+    if breaker:
+        entry["breaker"] = breaker
     if stream_complete is not None:
         entry["stream_complete"] = stream_complete
     if tokens:
@@ -426,6 +430,39 @@ EXPLORE_PRICE_FACTOR = float(os.environ.get("BRIDGE_EXPLORE_PRICE_FACTOR", "2.0"
 # relays, and never for relays pricier than BRIDGE_WARMUP_PRICE_FACTOR x the
 # cheapest. 0 disables warm-up.
 WARMUP_PRICE_FACTOR = float(os.environ.get("BRIDGE_WARMUP_PRICE_FACTOR", "2.0"))
+# ------------------------------------------------------------ circuit breaker
+# Measured price/latency is not enough: a relay that just returned 429, or whose
+# key is dead, must sit out regardless of how cheap it looks. Consecutive
+# failures open a breaker; the first real request after the cooldown is the
+# half-open probe, and every failed probe doubles the cooldown. Classification
+# follows model-hotel / LiteLLM: auth and quota are handled differently from a
+# burst of 5xx, and Retry-After is honoured.
+BREAKER_THRESHOLD = int(os.environ.get("BRIDGE_BREAKER_THRESHOLD", "5"))
+BREAKER_COOLDOWN = float(os.environ.get("BRIDGE_BREAKER_COOLDOWN", "60"))
+BREAKER_COOLDOWN_MAX = float(os.environ.get("BRIDGE_BREAKER_COOLDOWN_MAX", "900"))
+BREAKER_AUTH_COOLDOWN = float(os.environ.get("BRIDGE_BREAKER_AUTH_COOLDOWN", "3600"))
+BREAKER_QUOTA_MIN = float(os.environ.get("BRIDGE_BREAKER_QUOTA_MIN", "600"))
+BREAKER_QUOTA_MAX = float(os.environ.get("BRIDGE_BREAKER_QUOTA_MAX", "691200"))  # 8d
+RETRY_AFTER_MAX = float(os.environ.get("BRIDGE_RETRY_AFTER_MAX", "60"))
+# ---------------------------------------------------------- streaming health
+# A relay that opens a stream and then emits only bookkeeping events (or nothing
+# at all) must not be committed to - the client would simply hang. We buffer
+# until the first *content* frame, because before the first byte is the only
+# point where rotating is still possible. Once committed we cannot rotate any
+# more, so a stall is ended with a well-formed response.failed frame instead of
+# a truncated body.
+TTFT_MARKERS = (b'"response.output_text.delta"',
+                b'"response.function_call_arguments.delta"',
+                b'"response.reasoning_summary_text.delta"',
+                b'"response.reasoning_text.delta"',
+                b'"response.output_item.added"',
+                b'"response.content_part.added"')
+STREAM_END_MARKERS = (b'"response.completed"', b'"response.failed"',
+                      b'"response.incomplete"', b'data: [DONE]')
+TTFT_BUFFER_MAX = int(os.environ.get("BRIDGE_TTFT_BUFFER_MAX", str(512 * 1024)))
+STREAM_STALL = float(os.environ.get("BRIDGE_STREAM_STALL", "45"))
+STREAM_STALL_MULT = float(os.environ.get("BRIDGE_STREAM_STALL_MULT", "3"))
+STREAM_STALL_AFTER = int(os.environ.get("BRIDGE_STREAM_STALL_AFTER", "50"))
 HOUSEKEEPING_SECONDS = float(os.environ.get("BRIDGE_HOUSEKEEPING", "30"))
 # NOT state.json - that one belongs to watchdog.py
 STATE_FILE = os.environ.get("BRIDGE_STATE", os.path.join(BASE_DIR, "bridge-state.json"))
@@ -449,7 +486,9 @@ _prices_ready = threading.Event()
 def _bucket(pid):
     return _stats.setdefault(
         pid, {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
-              "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {}})
+              "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {},
+              "fails": 0, "open_until": 0.0, "cooldown": BREAKER_COOLDOWN,
+              "last_error": ""})
 
 
 def record_attempt(pid, seconds=None, failed=False):
@@ -482,13 +521,147 @@ def record_attempt(pid, seconds=None, failed=False):
         b["attempt_ts"] = now
 
 
+# ------------------------------------------------------- failure classification
+QUOTA_HINTS = ("usage_limit_reached", "insufficient_quota", "quota_exhausted",
+               "exceeded your current quota", "credit balance is too low",
+               "余额不足", "额度已用完", "欠费")
+RESET_KEYS = ("resets_at", "resets_in_seconds", "reset_at", "reset_after_seconds",
+              "reset_after", "reset_time", "retry_after")
+
+
+def _body_json(body):
+    if not body:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _find_reset_seconds(obj, depth=0):
+    """Pull a reset/retry hint out of an error body, whatever it is called.
+
+    codex-proxy documents the field-name mismatch: `resets_at` on the 429 body
+    vs `reset_at` on the usage endpoint - so all spellings are accepted here.
+    """
+    if depth > 4 or not isinstance(obj, (dict, list)):
+        return None
+    items = obj.items() if isinstance(obj, dict) else enumerate(obj)
+    for key, value in items:
+        if isinstance(key, str) and key.lower() in RESET_KEYS:
+            if isinstance(value, bool):
+                pass
+            elif isinstance(value, (int, float)):
+                if "at" in key.lower() and value > 1e9:      # absolute epoch
+                    return max(0.0, float(value) - time.time())
+                return max(0.0, float(value))
+            elif isinstance(value, str):
+                try:
+                    return max(0.0, float(value))
+                except ValueError:
+                    pass
+        found = _find_reset_seconds(value, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def classify_error(status, headers=None, body=None):
+    """-> (kind, retry_after_seconds, reset_seconds).
+
+    kinds: quota (park until the reset), auth (dead key: park long),
+    rate_limit (short throttle), timeout, server, model_missing, bad_request,
+    transport.
+    """
+    text = (body or b"").decode("utf-8", "replace").lower()
+    retry_after = None
+    for key, value in (headers or []):
+        if key.lower() == "retry-after":
+            try:
+                retry_after = max(0.0, float(value))
+            except (TypeError, ValueError):
+                retry_after = None
+    reset = _find_reset_seconds(_body_json(body))
+    if status == 402 or (status == 429 and any(h in text for h in QUOTA_HINTS)):
+        return "quota", retry_after, reset
+    if status == 429:
+        return "rate_limit", retry_after, reset
+    if status in (401, 403):
+        return "auth", retry_after, reset
+    if status == 404:
+        return "model_missing", retry_after, reset
+    if status in (408, 425, 504):
+        return "timeout", retry_after, reset
+    if status is not None and status >= 500:
+        return "server", retry_after, reset
+    if status is not None and status >= 400:
+        return "bad_request", retry_after, reset
+    return "transport", retry_after, reset
+
+
+def breaker_charge(pid, kind, retry_after=None, reset=None):
+    """Charge one failure to a relay and return its new breaker state."""
+    now = time.time()
+    with _stats_lock:
+        b = _bucket(pid)
+        b["fails"] = b.get("fails", 0) + 1
+        b["last_error"] = kind
+        if kind == "auth":
+            b["cooldown"] = BREAKER_AUTH_COOLDOWN
+            b["open_until"] = now + BREAKER_AUTH_COOLDOWN
+        elif kind == "quota":
+            hold = reset if reset else (retry_after or BREAKER_QUOTA_MIN)
+            hold = min(BREAKER_QUOTA_MAX, max(BREAKER_QUOTA_MIN, float(hold)))
+            b["cooldown"] = hold
+            # extend-only: a nearer reset must never shorten an existing hold
+            b["open_until"] = max(b.get("open_until") or 0, now + hold)
+        elif kind in ("rate_limit", "timeout", "server", "transport"):
+            if b["fails"] >= BREAKER_THRESHOLD:
+                cd = min(BREAKER_COOLDOWN_MAX,
+                         max(BREAKER_COOLDOWN,
+                             (b.get("cooldown") or BREAKER_COOLDOWN) * 2))
+                b["cooldown"] = cd
+                b["open_until"] = now + cd
+            elif retry_after:
+                b["open_until"] = max(b.get("open_until") or 0,
+                                      now + min(RETRY_AFTER_MAX, retry_after))
+        return _breaker_state_locked(b, now)
+
+
+def _breaker_state_locked(b, now):
+    if (b.get("open_until") or 0) > now:
+        return "open"
+    return "half-open" if b.get("fails") else "closed"
+
+
+def breaker_state(pid, now=None):
+    now = now or time.time()
+    with _stats_lock:
+        return _breaker_state_locked(_stats.get(pid) or {}, now)
+
+
+def breaker_ok(pid):
+    with _stats_lock:
+        b = _bucket(pid)
+        b["fails"] = 0
+        b["cooldown"] = BREAKER_COOLDOWN
+        b["open_until"] = 0
+        b["last_error"] = ""
+
+
+def breaker_open(pid, now=None):
+    now = now or time.time()
+    with _stats_lock:
+        return (_stats.get(pid) or {}).get("open_until", 0) > now
+
+
 def effective_latency(pid, now=None):
-    """Latency used for scoring: this hour's figure when we have enough
-    samples for it, otherwise the recent overall figure.
+    """Latency used for scoring: this hour's figure when it has enough samples,
+    otherwise the recent overall figure.
 
     Speed is a variable: a figure older than BRIDGE_LATENCY_MAX_AGE is dropped
-    (returns None -> the relay scores as "no data"), and the periodic
-    exploration below re-measures it.
+    (None -> the relay scores as "no data") and exploration re-measures it.
     """
     now = now or time.time()
     b = _stats.get(pid) or {}
@@ -787,6 +960,13 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 ordered.remove(pid)
                 ordered.insert(0, pid)
                 log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
+    if ORDER_MODE != "fixed":
+        now = time.time()
+        with _stats_lock:
+            broken = [p for p in ordered
+                      if (_stats.get(p) or {}).get("open_until", 0) > now]
+        if broken and len(broken) < len(ordered):
+            ordered = [p for p in ordered if p not in broken] + broken
     ordered = ordered + oauth
     if remember:
         _last_plan["order"] = ordered
@@ -849,6 +1029,10 @@ def status_snapshot(routes, base_order, model):
                 str(time.localtime(now).tm_hour), {}).get("samples", 0),
             "fail_rate": round(s["fail_rate"], 3) if s else None,
             "model_penalty": s.get("model_penalty"),
+            "breaker": breaker_state(pid),
+            "breaker_open_s": max(0, int((b.get("open_until") or 0) - now)),
+            "consecutive_fails": b.get("fails", 0),
+            "last_error": b.get("last_error", ""),
         })
     return {"mode": ORDER_MODE, "respect_start": RESPECT_START,
             "model": model, "order": ordered, "routes": rows,
@@ -1023,6 +1207,46 @@ def open_upstream(method, url, headers, body):
     return conn, resp
 
 
+def await_first_content(resp, timeout, limit=None):
+    """Wait until the stream shows *real model output* before committing.
+
+    A relay that accepts the request and then emits only bookkeeping events
+    (`response.created`, `in_progress`, keep-alives) is the classic "Codex looks
+    hung" failure: reading a single byte is not enough to rule it out. Before
+    the first content frame we can still rotate to the next relay, so this
+    buffers (bounded) until a content frame - or a terminal event, which counts
+    as a complete, possibly empty answer.
+
+    -> (ok, buffered_bytes, had_content)
+    """
+    limit = limit or TTFT_BUFFER_MAX
+    buf = b""
+    deadline = time.time() + timeout
+    while len(buf) < limit:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            resp.fp.raw._sock.settimeout(remaining)
+        except Exception:
+            pass
+        try:
+            # read1() returns as soon as one chunk is available; read(n) blocks
+            # until n bytes arrive, which would batch the stream in 8 KiB blocks
+            chunk = (resp.read1(4096) if hasattr(resp, "read1")
+                     else resp.read(4096))
+        except (socket.timeout, OSError):
+            break
+        if not chunk:
+            break
+        buf += chunk
+        if any(marker in buf for marker in TTFT_MARKERS):
+            return True, buf, True
+        if any(marker in buf for marker in STREAM_END_MARKERS):
+            return True, buf, False
+    return False, buf, False
+
+
 def read_all(resp, limit=8 * 1024 * 1024):
     chunks, total = [], 0
     while True:
@@ -1085,8 +1309,12 @@ class Handler(BaseHTTPRequestHandler):
             log("CLIENT-GONE while sending %s: %s" % (status, exc))
 
     def _stream(self, status, headers, resp, head=b"", scanner=None):
-        """Relay a stream. Returns True if the upstream stream ended normally,
-        False if the client went away first (then there is no final usage)."""
+        """Relay a stream.
+
+        Returns "complete", "client-gone" or "stalled". Once any byte has gone
+        out we can no longer rotate, so a stall is ended with a well-formed
+        response.failed frame rather than a silently truncated body.
+        """
         try:
             self.send_response(status)
             for key, value in headers:
@@ -1099,19 +1327,45 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n" % len(head) + head + b"\r\n")
                 if scanner:
                     scanner.feed(head)
+            chunks = 0
+            stalled = False
             while True:
-                chunk = resp.read(8192)
+                window = STREAM_STALL * (STREAM_STALL_MULT
+                                         if chunks >= STREAM_STALL_AFTER else 1.0)
+                try:
+                    resp.fp.raw._sock.settimeout(window)
+                except Exception:
+                    pass
+                try:
+                    # read1(): forward each upstream chunk immediately instead of
+                    # waiting for 8 KiB (latency matters for SSE deltas)
+                    chunk = (resp.read1(8192) if hasattr(resp, "read1")
+                             else resp.read(8192))
+                except (socket.timeout, OSError):
+                    stalled = True
+                    break
                 if not chunk:
                     break
+                chunks += 1
                 self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
                 if scanner:
                     scanner.feed(chunk)
+            if stalled:
+                frame = (b"event: response.failed\n"
+                         b'data: {"type":"response.failed","response":{"status":"failed",'
+                         b'"error":{"code":"stream_stalled","type":"upstream_error",'
+                         b'"message":"retry bridge: upstream stopped sending data"}}}\n\n')
+                self.wfile.write(b"%x\r\n" % len(frame) + frame + b"\r\n")
+                if scanner:
+                    scanner.feed(frame)
+                log("STALL %s: no data for %.0fs, ended the stream with response.failed"
+                    % (self.path, window))
             self.wfile.write(b"0\r\n\r\n")
-            return True
+            return "stalled" if stalled else "complete"
         except OSError as exc:
             self.close_connection = True
             log("CLIENT-GONE / upstream cut mid-stream: %s" % exc)
-            return False
+            return "client-gone"
 
     def _status(self, split):
         """GET /__bridge/status[?model=...][&text=1] - the live ranking."""
@@ -1143,6 +1397,12 @@ class Handler(BaseHTTPRequestHandler):
                                     "-", "oauth 账号，固定队尾"))
                     continue
                 age = row["price_age_s"]
+                if row.get("breaker") == "open":
+                    row_note = "熔断 %ds" % row.get("breaker_open_s", 0)
+                    if row["price_note"]:
+                        row_note += " · " + row["price_note"]
+                else:
+                    row_note = row["price_note"] or ""
                 lines.append("%-22s %7s %10s %6s %9s %5s %6s %5s  %s"
                              % (row["name"][:22],
                                 row["score"] if row["score"] is not None else "-",
@@ -1152,7 +1412,7 @@ class Handler(BaseHTTPRequestHandler):
                                 row["latency_samples"] or "-",
                                 ("%.2f" % row["fail_rate"]) if row["fail_rate"] is not None else "-",
                                 ("-%.1f" % row["model_penalty"]) if row["model_penalty"] else "ok",
-                                row["price_note"]
+                                row_note
                                 or ("价格 %s前" % _ago(age) if age is not None else "")))
             body = ("\n".join(lines) + "\n").encode("utf-8")
             self._send(200, [("Content-Type", "text/plain; charset=utf-8")], body)
@@ -1274,20 +1534,11 @@ class Handler(BaseHTTPRequestHandler):
                     # "stream disconnected before completion"; rotating to the
                     # next relay is far better than handing the client a
                     # truncated body.
-                    head = b""
-                    try:
-                        resp.fp.raw._sock.settimeout(FIRST_BYTE_TIMEOUT)
-                        head = resp.read(1)
-                    except (socket.timeout, OSError) as exc:
-                        log("RETRY %s %s -> no first byte via %s (attempt %d/%d): %s"
-                            % (method, split.path, route["name"], done, attempts, exc))
-                        head = b""
-                    finally:
-                        try:
-                            resp.fp.raw._sock.settimeout(READ_TIMEOUT)
-                        except Exception:
-                            pass
-                    if not head:
+                    ok, head, had_content = await_first_content(
+                        resp, FIRST_BYTE_TIMEOUT)
+                    if not ok:
+                        log("RETRY %s %s -> no content frame via %s (attempt %d/%d)"
+                            % (method, split.path, route["name"], done, attempts))
                         last = {"status": 200,
                                 "headers": [("Content-Type", "application/json")],
                                 "body": json.dumps({"error": {
@@ -1295,8 +1546,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "type": "upstream_error"}}).encode()}
                         netfails += 1
                         record_attempt(pid, failed=True)
+                        state = breaker_charge(pid, "timeout")
                         log_request(mount_name, route["name"], wanted, done, 200, None,
-                                    "stalled", mount_id=start_pid, relay_id=pid)
+                                    "stalled", mount_id=start_pid, relay_id=pid,
+                                    error_kind="no_content", breaker=state)
                         conn.close()
                         conn = None
                     else:
@@ -1307,7 +1560,12 @@ class Handler(BaseHTTPRequestHandler):
                             % (method, split.path, status, route["name"], done,
                                attempts, wanted or "?"))
                         scanner = UsageScanner()
-                        complete = self._stream(status, raw_headers, resp, head, scanner)
+                        outcome = self._stream(status, raw_headers, resp, head, scanner)
+                        if outcome == "complete":
+                            breaker_ok(pid)
+                        elif outcome == "stalled":
+                            breaker_charge(pid, "timeout")
+                        complete = (outcome == "complete")
                         log_request(mount_name, route["name"], wanted, done, status,
                                     ttfb, "ok", pid=pid, tokens=scanner.tokens(),
                                     stream_complete=complete,
@@ -1329,6 +1587,7 @@ class Handler(BaseHTTPRequestHandler):
                     if status == 200:
                         seconds = time.time() - attempt_started
                         record_attempt(pid, seconds)
+                        breaker_ok(pid)
                         try:
                             payload = json.loads(body.decode("utf-8")) or {}
                             tokens = normalise_usage(payload.get("usage"))
@@ -1347,18 +1606,33 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 record_attempt(pid, failed=True)
+                kind, retry_after, reset = classify_error(status, raw_headers, body)
+                if is_retryable_body(body):
+                    kind = "upstream"
+                state = "noop"
+                if kind not in ("bad_request", "model_missing"):
+                    state = breaker_charge(pid, kind, retry_after, reset)
+                if retry_after:
+                    backoff_hint = min(RETRY_AFTER_MAX, retry_after)
+                else:
+                    backoff_hint = None
                 log_request(mount_name, route["name"], wanted, done, status, None,
-                            "retry", mount_id=start_pid, relay_id=pid)
+                            "retry", mount_id=start_pid, relay_id=pid,
+                            error_kind=kind, breaker=state)
                 last = {"status": status, "headers": raw_headers, "body": body}
                 netfails = 0
                 snippet = body[:120].decode("utf-8", "replace").replace("\n", " ")
-                log("RETRY %s %s -> %s via %s (attempt %d/%d) model=%s %s"
+                log("RETRY %s %s -> %s via %s (attempt %d/%d) model=%s kind=%s breaker=%s %s"
                     % (method, split.path, status, route["name"], done, attempts,
-                       wanted or "?", snippet))
+                       wanted or "?", kind, state, snippet))
+                if backoff_hint:
+                    time.sleep(backoff_hint)
             except (socket.timeout, OSError) as exc:
                 record_attempt(pid, failed=True)
+                state = breaker_charge(pid, "transport")
                 log_request(mount_name, route["name"], wanted, done, None, None,
-                            "network-error", mount_id=start_pid, relay_id=pid)
+                            "network-error", mount_id=start_pid, relay_id=pid,
+                            error_kind="transport", breaker=state)
                 last = {"status": None,
                         "headers": [("Content-Type", "application/json")],
                         "body": json.dumps({"error": {
