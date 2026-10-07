@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Every 60s: if CC Switch handed Codex back to the official account (which puts
+  the bridge out of the path silently), switch the current provider back to a
+  bridged one. Install:
+
+    cp com.local.relay-takeover.plist.example ~/Library/LaunchAgents/com.local.relay-takeover.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.relay-takeover.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.relay-takeover</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/REPLACE_ME/.ccswitch-retry-bridge/takeover.py</string>
+    <string>--fix</string>
+    <string>--quiet</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/REPLACE_ME/.ccswitch-retry-bridge</string>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_ME/.ccswitch-retry-bridge/takeover.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_ME/.ccswitch-retry-bridge/takeover.err.log</string>
+</dict>
+</plist>

@@ -64,6 +64,13 @@ LiteLLM 的 `cost-based-routing` 用**静态价格表**、延迟用**全局平�
    顺带做了**余额感知**：`/v1/usage` 刷新时读回余额，低于阈值就 park。
 5. **标签约束**：客户端用请求头表达 `cheap` / `!expensive`，排序在子集内进行（LiteLLM 的 tag routing，带否定）。
 
+## 运维教训（2026-10-07 实测）
+
+**桥重启会让流量永久绕过桥。** 桥重启的那几秒里 CC Switch 的 12 个桥接供应商同时失败，
+它据此把 Codex 交还给官方账号，之后一直直连 `chatgpt.com`——功能正常，所以静默失效
+（当天 11:04 切走，13:30 才发现）。对策是 `takeover.py`（检测 + 恢复 + 每 60 秒的 launchd 守卫），
+见 README「别让流量悄悄绕过桥」。**这是本项目最值得记住的一条运维事实。**
+
 ## 参考
 
 - codex-relay：`src/quirks.rs`（quirk 注册表）、`src/stream.rs`（SSE 映射）、`src/session.rs`（会话存储与指纹）

@@ -277,6 +277,39 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
 > 风险最低；若希望桥主动刷新，建议给桥一个独立的 `CODEX_HOME`
 > （`BRIDGE_OAUTH_DIRS=/path/to/bridge-codex`，在那里单独 `codex login` 一次）。
 
+### 别让流量悄悄绕过桥（`takeover.py`）
+
+**这是最容易踩、也最难察觉的一种失效**：桥一重启（部署、崩溃、休眠唤醒），
+CC Switch 的 12 个桥接供应商会在同一瞬间全部失败。它据此认为"代理没有可用供应商"，
+于是**把 Codex 交还给你自己的官方账号**——从那一刻起 Codex 直连 `chatgpt.com`，
+桥完全不在链路上。**一切照常能用**（花的是你的订阅额度），所以你不会发现，
+直到想起来看统计。
+
+```bash
+python3 takeover.py --status     # 现在到底走哪？
+python3 takeover.py --fix        # 恢复接管
+python3 takeover.py --watch      # 常驻检查（或见 launchd/ 示例，每 60 秒一次）
+```
+
+`--status` 会直接告诉你：
+
+```
+桥             : 健康（13 条路由）
+CC Switch 当前 : codex-official
+  指向桥        : 否
+代理接管中     : 否 ← 流量没走桥
+建议切回       : pp 特惠（5fee0521-…）
+```
+
+**它做什么**：确认桥健康 → 把 CC Switch 的 `currentProviderCodex` 换成**桥排名第一**且
+确实指向桥的供应商 → 等最多 `BRIDGE_TAKEOVER_GRACE`（默认 15s）看 CC Switch 是否自己接管
+→ 没反应就重启 CC Switch（带 `BRIDGE_TAKEOVER_RESTART_COOLDOWN`，默认 15 分钟冷却，
+避免"重启→又被交还→再重启"的循环）。
+
+**故意想用自己的账号**时，停掉它即可：`touch TAKEOVER.DISABLED`（`--fix` 会立刻让步）。
+
+> 结论：**桥每次重启后都值得跑一次 `takeover.py --fix`**，或者把 launchd 那个守卫挂上。
+
 ### 接入只支持 Chat Completions 的渠道（sidecar）
 
 我们的桥讲 **Responses API**（Codex 用的协议），而不少便宜渠道（DeepSeek、Kimi、Qwen、GLM、
@@ -388,6 +421,8 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXPLORE_PRICE_FACTOR` | `2.0` | 探索只挑「最便宜的几倍」以内的中转（`0` = 不限价格）|
 | `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
 | `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
+| `BRIDGE_TAKEOVER_GRACE` | `15` | 改完设置等 CC Switch 自己接管的秒数，超时再重启它 |
+| `BRIDGE_TAKEOVER_RESTART_COOLDOWN` | `900` | 两次自动重启 CC Switch 之间的最小间隔 |
 | `BRIDGE_SIDECARS` | `<脚本目录>/sidecars.json` | sidecar 清单（setup.py 与 sidecar.py 都读它）|
 | `BRIDGE_CODEX_RELAY` | `<脚本目录>/bin/codex-relay` | codex-relay 可执行文件路径 |
 | `BRIDGE_MIN_BALANCE` | `1.0` | 余额低于这个数（美元）就 park 该中转 |
