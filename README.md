@@ -125,6 +125,15 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
   4. **一次成功全清**：`fails`、熔断、冷却、降权全部归零。
   客户端主动中断（Ctrl-C / 关连接）**不算失败**，不会降权（有端到端用例守着）。
   状态页会显示 `连败N·降权X(衰减后)·Ns后探针`。
+* **首字节过慢也降权**（`BRIDGE_SLOW_TTFB`，默认 15s）：中位数会把长尾藏起来
+  （某家 6s 中位、但 1/5 的请求让你等 20 秒），所以慢首字节单独算：
+  1. **按发生率**（`BRIDGE_W_SLOW_TTFB`=2.0，EWMA α=`BRIDGE_SLOW_ALPHA`=0.25）：
+     偶发一次只轻推，系统性慢则重罚，快速响应会把它衰减回去。
+  2. **最近一次慢立刻降权**（`BRIDGE_W_SLOW_STREAK`=1.0，上限 `BRIDGE_SLOW_STREAK_CAP`=2，
+     `BRIDGE_SLOW_STREAK_TTL`=300s 内线性衰减）：刚让你等 15s 的中转不会马上又被选中。
+  3. **一次快速响应清零连慢**；且**慢 ≠ 失败**——不记失败、不熔断。
+  只会用**流式首字节**判定（非流式的总时长不是首字节）；逐请求日志里带 `slow_first_byte` 便于复盘。
+  实测基线：近 24h 6265 个请求里 **1.9%** 首字节 >15s，且集中（wdlink plus 7%、pp 特惠 2%）。
 
 * 官方订阅账号（`auth_type: "oauth"`）**永远排最后**，仍然单独限次。
 * `BRIDGE_ORDER_MODE=fixed` 可以退回原来的行为：从 CC Switch 选中的那家开始轮询。
@@ -454,6 +463,11 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_W_FAIL_STREAK` | `1.0` | 每多一次连续失败的立刻降权量 |
 | `BRIDGE_FAIL_STREAK_CAP` | `3` | 连续失败降权的上限倍数 |
 | `BRIDGE_FAIL_STREAK_TTL` | `900` | 降权衰减到 0 的时长（秒）|
+| `BRIDGE_SLOW_TTFB` | `15` | 首字节超过这个秒数就算"慢" |
+| `BRIDGE_W_SLOW_TTFB` | `2.0` | 慢首字节发生率的权重 |
+| `BRIDGE_W_SLOW_STREAK` | `1.0` | 最近一次慢的立刻降权量 |
+| `BRIDGE_SLOW_STREAK_CAP` | `2` | 连慢降权上限 |
+| `BRIDGE_SLOW_STREAK_TTL` | `300` | 连慢降权的衰减时长（秒）|
 | `BRIDGE_PROBE_AFTER` | `120` | 连败后多久保底重试一次 |
 | `BRIDGE_PROBE_MAX` | `1800` | 探针间隔上限（按连败翻倍）|
 | `BRIDGE_LAT_RING` | `15` | 延迟中位数的样本窗口 |

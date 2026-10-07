@@ -121,7 +121,8 @@ def log(msg):
 
 def log_request(mount, relay, model, attempt, status, seconds, result,
                 pid=None, tokens=None, stream_complete=None, response_id=None,
-                mount_id=None, relay_id=None, error_kind=None, breaker=None):
+                mount_id=None, relay_id=None, error_kind=None, breaker=None,
+                slow_first_byte=None):
     """Append one structured request line (see BRIDGE_REQUEST_LOG).
 
     `tokens` comes from the relay's own `usage` block; `est_cost_usd` prices it
@@ -153,6 +154,8 @@ def log_request(mount, relay, model, attempt, status, seconds, result,
         entry["breaker"] = breaker
     if stream_complete is not None:
         entry["stream_complete"] = stream_complete
+    if slow_first_byte is not None:
+        entry["slow_first_byte"] = bool(slow_first_byte)
     if tokens:
         entry["tokens"] = tokens
         entry["price_per_m"] = round(price, 5) if price else None
@@ -605,6 +608,21 @@ FAIL_STREAK_TTL = float(os.environ.get("BRIDGE_FAIL_STREAK_TTL", "900"))
 #     relay is probed rarely while a transient blip is re-checked in a minute.
 PROBE_AFTER = float(os.environ.get("BRIDGE_PROBE_AFTER", "120"))
 PROBE_MAX = float(os.environ.get("BRIDGE_PROBE_MAX", "1800"))
+# A first byte slower than this is a bad experience no matter how good the
+# median looks (a relay with a 6s median can still make you wait 20s on one
+# request in five). Demote by the *rate* of such attempts: one blip barely
+# moves it, systematic slowness pushes the relay down, and fast replies decay
+# it back. Measured on first-byte attempts only (a non-streaming reply's total
+# duration is not a first byte).
+SLOW_TTFB = float(os.environ.get("BRIDGE_SLOW_TTFB", "15"))
+W_SLOW_TTFB = float(os.environ.get("BRIDGE_W_SLOW_TTFB", "2.0"))
+SLOW_ALPHA = float(os.environ.get("BRIDGE_SLOW_ALPHA", "0.25"))
+# ...and the *latest* slow reply demotes immediately (same shape as the failure
+# streak: immediate, capped, decays by itself, cleared by the next fast reply),
+# so a relay that just made you wait 15s does not keep being picked.
+W_SLOW_STREAK = float(os.environ.get("BRIDGE_W_SLOW_STREAK", "1.0"))
+SLOW_STREAK_CAP = int(os.environ.get("BRIDGE_SLOW_STREAK_CAP", "2"))
+SLOW_STREAK_TTL = float(os.environ.get("BRIDGE_SLOW_STREAK_TTL", "300"))
 MODEL_ADAPT_PENALTY = float(os.environ.get("BRIDGE_MODEL_ADAPT_PENALTY", "0.4"))
 MODEL_MISSING_PENALTY = float(os.environ.get("BRIDGE_MODEL_MISSING_PENALTY", "1.5"))
 EWMA_ALPHA = float(os.environ.get("BRIDGE_EWMA_ALPHA", "0.3"))
@@ -733,6 +751,8 @@ _prices_ready = threading.Event()
 BUCKET_DEFAULTS = {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
                    "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {},
                    "lat_ring": [], "lat_by_model": {},
+                   "slow": 0.0, "slow_ttfb": 0, "fast_ttfb": 0, "slow_last": 0.0,
+                   "slow_streak": 0, "slow_streak_ts": 0.0,
                    "fails": 0, "open_until": 0.0, "cooldown": BREAKER_COOLDOWN,
                    "last_error": ""}
 
@@ -752,7 +772,7 @@ def _bucket(pid):
     return b
 
 
-def record_attempt(pid, seconds=None, failed=False, model=None):
+def record_attempt(pid, seconds=None, failed=False, model=None, first_byte=False):
     """Feed one attempt into the relay's score.
 
     Three axes, all time-varying: EWMA overall, EWMA for the current hour of the
@@ -772,6 +792,17 @@ def record_attempt(pid, seconds=None, failed=False, model=None):
             if seconds is not None:
                 b["lat"] = seconds if b["lat"] is None else (
                     b["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
+                if first_byte:
+                    slow = 1.0 if seconds > SLOW_TTFB else 0.0
+                    b["slow"] = b["slow"] * (1 - SLOW_ALPHA) + slow * SLOW_ALPHA
+                    if slow:
+                        b["slow_ttfb"] = b.get("slow_ttfb", 0) + 1
+                        b["slow_last"] = seconds
+                        b["slow_streak"] = b.get("slow_streak", 0) + 1
+                        b["slow_streak_ts"] = now
+                    else:
+                        b["fast_ttfb"] = b.get("fast_ttfb", 0) + 1
+                        b["slow_streak"] = 0          # a fast reply clears it
                 b["samples"] += 1
                 b["lat_ts"] = now
                 ring = b.setdefault("lat_ring", [])
@@ -1257,10 +1288,18 @@ def relay_scores(pids, routes, model, affinity_pid=None):
             decay = max(0.0, 1.0 - age / FAIL_STREAK_TTL)   # recovers by itself
         streak = min(streak, FAIL_STREAK_CAP)
         streak_pen = W_FAIL_STREAK * streak * decay
+        slow_rate = float(b.get("slow") or 0.0)
+        slow_pen = W_SLOW_TTFB * slow_rate
+        slow_streak = min(int(b.get("slow_streak") or 0), SLOW_STREAK_CAP)
+        slow_decay = 1.0
+        if slow_streak and SLOW_STREAK_TTL > 0:
+            age = time.time() - (b.get("slow_streak_ts") or 0)
+            slow_decay = max(0.0, 1.0 - age / SLOW_STREAK_TTL)
+        slow_pen += W_SLOW_STREAK * slow_streak * slow_decay
         out[pid] = {
             "affinity": bool(bonus),
             "score": (W_PRICE * p_norm + W_LATENCY * l_norm + W_FAIL * fail_rate
-                      + pen + streak_pen - bonus),
+                      + pen + streak_pen + slow_pen - bonus),
             "price_per_m": price, "price_norm": p_norm,
             "latency": lat, "latency_norm": l_norm,
             "fail_rate": fail_rate, "model_penalty": pen,
@@ -1269,6 +1308,12 @@ def relay_scores(pids, routes, model, affinity_pid=None):
             "streak_decay": round(decay, 3),
             "streak_capped": streak,
             "streak_penalty": round(streak_pen, 3),
+            "slow_rate": round(slow_rate, 3),
+            "slow_penalty": round(slow_pen, 3),
+            "slow_ttfb": int(b.get("slow_ttfb") or 0),
+            "slow_streak": slow_streak,
+            "slow_streak_raw": int(b.get("slow_streak") or 0),
+            "slow_streak_decay": round(slow_decay, 3),
             "exact_model": exact,
             "samples": b.get("samples", 0),
             "error": (_prices.get(pid) or {}).get("error", ""),
@@ -1529,6 +1574,11 @@ def status_snapshot(routes, base_order, model):
             "fixed_price": bool(route.get("price_per_m")),
             "streak": s.get("streak", 0) if s else 0,
             "streak_penalty": s.get("streak_penalty", 0.0) if s else 0.0,
+            "slow_rate": s.get("slow_rate", 0.0) if s else 0.0,
+            "slow_penalty": s.get("slow_penalty", 0.0) if s else 0.0,
+            "slow_ttfb": b.get("slow_ttfb", 0),
+            "slow_streak": s.get("slow_streak", 0) if s else 0,
+            "last_slow_s": b.get("slow_last") or None,
             "streak_decay": s.get("streak_decay", 1.0) if s else 1.0,
             "probe_in_s": (max(0, int(PROBE_AFTER * (2 ** max(0, b.get("fails", 0) - 1))
                                       - (now - last_attempt(pid))))
@@ -1970,9 +2020,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     row_note = row["price_note"] or ""
                 note_extra = ""
+                if row.get("slow_rate", 0) >= 0.05 or row.get("slow_streak"):
+                    note_extra = "慢首字节>%.0fs占%.0f%%" % (SLOW_TTFB, 100 * row["slow_rate"])
+                    if row.get("slow_streak"):
+                        note_extra += "·连慢%d" % row["slow_streak"]
+                    note_extra += "·降权%.1f" % row.get("slow_penalty", 0)
                 if row.get("streak"):
-                    note_extra = "连败%d·降权%.1f(衰减后)" % (row["streak"],
-                                                             row.get("streak_penalty", 0))
+                    note_extra = (note_extra + " · " if note_extra else "") + (
+                        "连败%d·降权%.1f(衰减后)" % (row["streak"], row.get("streak_penalty", 0)))
                     if row.get("probe_in_s") is not None:
                         note_extra += "·%ds后探针" % row["probe_in_s"]
                 if row.get("fixed_price"):
@@ -2203,7 +2258,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         # first byte is what "faster to call" really means here
                         ttfb = time.time() - attempt_started
-                        record_attempt(pid, ttfb, model=wanted)
+                        record_attempt(pid, ttfb, model=wanted, first_byte=True)
                         log("OK    %s %s -> %s via %s (attempt %d/%d) model=%s"
                             % (method, split.path, status, route["name"], done,
                                attempts, wanted or "?"))
@@ -2214,8 +2269,13 @@ class Handler(BaseHTTPRequestHandler):
                         elif outcome == "stalled":
                             breaker_charge(pid, "timeout")
                         complete = (outcome == "complete")
+                        if ttfb is not None and ttfb > SLOW_TTFB:
+                            log("SLOW  %s first byte %.1fs (> %.0fs threshold)"
+                                % (route["name"], ttfb, SLOW_TTFB))
                         log_request(mount_name, route["name"], wanted, done, status,
-                                    ttfb, "ok", pid=pid, tokens=scanner.tokens(),
+                                    ttfb, "ok", pid=pid, slow_first_byte=(ttfb is not None
+                                                                          and ttfb > SLOW_TTFB),
+                                    tokens=scanner.tokens(),
                                     stream_complete=complete,
                                     response_id=scanner.response_id,
                                     mount_id=start_pid, relay_id=pid)

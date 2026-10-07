@@ -167,6 +167,8 @@ class FailStreakTest(unittest.TestCase):
     def setUp(self):
         bridge_mod._stats.clear()
         bridge_mod._prices.clear()
+        bridge_mod._last_plan["order"] = []          # no hysteresis from the last test
+        bridge_mod._last_plan["signature"] = ""
         self.routes = {p: {"name": p.upper()} for p in ("a", "b")}
         for pid in ("a", "b"):
             bridge_mod._prices[pid] = {"ts": time.time(), "per_model": {},
@@ -350,6 +352,114 @@ class FailStreakTest(unittest.TestCase):
                 proc.kill()
             server.shutdown()
             server.server_close()
+
+
+class SlowFirstByteTest(unittest.TestCase):
+    """A first byte slower than BRIDGE_SLOW_TTFB (default 15s) demotes a relay by
+    its *rate*: the median hides the tail (6s typical, 20s on one request in
+    five), which is exactly what the user feels."""
+
+    def setUp(self):
+        bridge_mod._stats.clear()
+        bridge_mod._prices.clear()
+        bridge_mod._last_plan["order"] = []          # no hysteresis from the last test
+        bridge_mod._last_plan["signature"] = ""
+        self.routes = {p: {"name": p.upper()} for p in ("a", "b")}
+        for pid in ("a", "b"):
+            bridge_mod._prices[pid] = {"ts": time.time(), "per_model": {},
+                                       "overall": 0.05, "trend": 1.0, "error": ""}
+        for _ in range(6):
+            bridge_mod.record_attempt("a", 6.0, model=MODEL_A, first_byte=True)
+            bridge_mod.record_attempt("b", 6.0, model=MODEL_A, first_byte=True)
+
+    def scores(self):
+        return bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)
+
+    def test_at_the_threshold_is_not_slow_and_above_is(self):
+        bridge_mod.record_attempt("a", bridge_mod.SLOW_TTFB, model=MODEL_A,
+                                  first_byte=True)
+        self.assertEqual(bridge_mod._stats["a"]["slow_ttfb"], 0)
+        bridge_mod.record_attempt("a", bridge_mod.SLOW_TTFB + 0.1, model=MODEL_A,
+                                  first_byte=True)
+        self.assertEqual(bridge_mod._stats["a"]["slow_ttfb"], 1)
+
+    def test_a_slow_first_byte_demotes_and_a_fast_one_recovers(self):
+        order, scores = self.scores()
+        self.assertEqual(order[0], "a")
+        self.assertEqual(scores["a"]["slow_penalty"], 0.0)
+        bridge_mod.record_attempt("a", 25.0, model=MODEL_A, first_byte=True)
+        order, scores = self.scores()
+        self.assertEqual(order[0], "b")
+        self.assertAlmostEqual(scores["a"]["slow_rate"], bridge_mod.SLOW_ALPHA, places=6)
+        self.assertAlmostEqual(
+            scores["a"]["slow_penalty"],
+            bridge_mod.W_SLOW_TTFB * bridge_mod.SLOW_ALPHA + bridge_mod.W_SLOW_STREAK,
+            places=6)
+        for _ in range(8):                       # fast replies decay it away
+            bridge_mod.record_attempt("a", 6.0, model=MODEL_A, first_byte=True)
+        self.assertLess(self.scores()[1]["a"]["slow_penalty"], 0.1)
+
+    def test_repeated_slowness_compounds(self):
+        for _ in range(4):
+            bridge_mod.record_attempt("a", 20.0, model=MODEL_A, first_byte=True)
+        _order, scores = self.scores()
+        self.assertGreater(scores["a"]["slow_penalty"], bridge_mod.W_SLOW_TTFB * 0.5)
+        self.assertEqual(scores["a"]["slow_ttfb"], 4)
+
+    def test_a_single_slow_first_byte_demotes_immediately(self):
+        before = self.scores()[1]["a"]["slow_penalty"]
+        bridge_mod.record_attempt("a", 20.0, model=MODEL_A, first_byte=True)
+        after = self.scores()[1]["a"]
+        self.assertEqual(before, 0.0)
+        self.assertEqual(after["slow_streak"], 1)
+        self.assertAlmostEqual(
+            after["slow_penalty"],
+            bridge_mod.W_SLOW_TTFB * bridge_mod.SLOW_ALPHA + bridge_mod.W_SLOW_STREAK,
+            places=6)
+
+    def test_a_fast_reply_clears_the_slow_streak(self):
+        bridge_mod.record_attempt("a", 20.0, model=MODEL_A, first_byte=True)
+        bridge_mod.record_attempt("a", 20.0, model=MODEL_A, first_byte=True)
+        self.assertEqual(self.scores()[1]["a"]["slow_streak"], 2)
+        bridge_mod.record_attempt("a", 6.0, model=MODEL_A, first_byte=True)
+        self.assertEqual(self.scores()[1]["a"]["slow_streak"], 0)
+
+    def test_the_slow_streak_is_capped_and_decays(self):
+        for _ in range(6):
+            bridge_mod.record_attempt("a", 30.0, model=MODEL_A, first_byte=True)
+        scores = self.scores()[1]["a"]
+        self.assertEqual(scores["slow_streak"], bridge_mod.SLOW_STREAK_CAP)
+        self.assertEqual(scores["slow_streak_raw"], 6)
+        self.assertEqual(scores["slow_streak_decay"], 1.0)
+        bridge_mod._stats["a"]["slow_streak_ts"] = (
+            time.time() - bridge_mod.SLOW_STREAK_TTL - 1)
+        self.assertEqual(self.scores()[1]["a"]["slow_streak_decay"], 0.0)
+
+    def test_a_non_streaming_total_is_not_a_first_byte(self):
+        bridge_mod.record_attempt("a", 99.0, model=MODEL_A)      # no first_byte flag
+        self.assertEqual(bridge_mod._stats["a"]["slow_ttfb"], 0)
+        self.assertEqual(self.scores()[1]["a"]["slow_penalty"], 0.0)
+
+    def test_it_demotes_without_being_a_failure(self):
+        bridge_mod.record_attempt("a", 25.0, model=MODEL_A, first_byte=True)
+        self.assertEqual(bridge_mod._stats["a"]["fails"], 0)     # not a failure
+        self.assertFalse(bridge_mod.breaker_open("a"))
+        self.assertEqual(bridge_mod._stats["a"]["fail"], 0.0)
+
+    def test_the_request_log_marks_it(self):
+        tmp = tempfile.mkdtemp(prefix="slowlog-")
+        old = bridge_mod.REQUEST_LOG
+        bridge_mod.REQUEST_LOG = os.path.join(tmp, "requests.jsonl")
+        try:
+            bridge_mod.log_request("m", "r", MODEL_A, 1, 200, 22.0, "ok",
+                                   slow_first_byte=True)
+            bridge_mod.log_request("m", "r", MODEL_A, 1, 200, 3.0, "ok",
+                                   slow_first_byte=False)
+        finally:
+            bridge_mod.REQUEST_LOG = old
+        rows = [json.loads(l) for l in open(os.path.join(tmp, "requests.jsonl"))]
+        self.assertTrue(rows[0]["slow_first_byte"])
+        self.assertFalse(rows[1]["slow_first_byte"])
 
 
 class LegacyStateTest(unittest.TestCase):
