@@ -278,6 +278,7 @@ def load_routes(force=False):
         upstream = (entry.get("upstream") or "").rstrip("/")
         if not mount or not upstream:
             continue
+        model_map = entry.get("model_map")
         routes[pid] = {
             "mount": mount,
             "upstream": upstream,
@@ -287,6 +288,11 @@ def load_routes(force=False):
             "auth_file": entry.get("auth_file") or "",
             "max_attempts": entry.get("max_attempts"),
             "name": entry.get("name") or pid,
+            # a sidecar (e.g. codex-relay in front of a chat-completions-only
+            # provider) needs the client's model name rewritten, and has no
+            # /v1/usage to read a price from - so both can be declared per route
+            "model_map": model_map if isinstance(model_map, dict) else None,
+            "price_per_m": entry.get("price_per_m"),
         }
     order = [pid for pid in (data.get("order") or []) if pid in routes]
     order += [pid for pid in routes if pid not in order]
@@ -296,7 +302,22 @@ def load_routes(force=False):
         _state["mounts"] = {r["mount"]: pid for pid, r in routes.items()}
         _state["attempts"] = int(data.get("attempts") or DEFAULT_ATTEMPTS)
         _state_mtime = mtime
-    log("routes loaded: %d relay(s), attempts=%d" % (len(routes), _state["attempts"]))
+        seeded = 0
+        for pid, route in routes.items():
+            price = route.get("price_per_m")
+            if not price:
+                continue
+            with _stats_lock:
+                ent = _prices.get(pid) or {}
+                if not ent.get("static"):
+                    _prices[pid] = {"ts": time.time(), "per_model": {}, "overall": float(price),
+                                    "trend": 1.0, "error": "", "static": True}
+                    seeded += 1
+    if seeded:
+        _prices_ready.set()
+    log("routes loaded: %d relay(s), attempts=%d%s"
+        % (len(routes), _state["attempts"],
+           ", %d fixed price(s)" % seeded if seeded else ""))
 
 
 def resolve(path):
@@ -1032,8 +1053,8 @@ def refresh_prices(routes, force=False):
     todo = []
     with _stats_lock:
         for pid, route in routes.items():
-            if route.get("auth_type") == "oauth":
-                continue
+            if route.get("auth_type") == "oauth" or route.get("price_per_m"):
+                continue                      # oauth has no /v1/usage, sidecars declare a price
             if not force and now - (_prices.get(pid) or {}).get("ts", 0) < PRICE_TTL:
                 continue
             todo.append((pid, dict(route)))
@@ -1369,6 +1390,7 @@ def status_snapshot(routes, base_order, model):
             "fail_rate": round(s["fail_rate"], 3) if s else None,
             "model_penalty": s.get("model_penalty"),
             "balance": b.get("balance"),
+            "fixed_price": bool(route.get("price_per_m")),
             "affinity": sticky.get(pid, 0) > 0,
             "affinity_sessions": sticky.get(pid, 0),
             "breaker": breaker_state(pid),
@@ -1484,6 +1506,33 @@ def route_models(pid, route):
     return ids
 
 
+def apply_model_map(body, pid, route):
+    """Rewrite the client's model to the name this route really serves.
+
+    A sidecar in front of a chat-completions-only provider has no `gpt-*`
+    models at all, so guessing from /v1/models cannot work: the route declares
+    `model_map` (`{"gpt-6.1-sol": "deepseek-chat", "*": "deepseek-chat"}`).
+    Explicit mapping wins; the caller skips further adaptation afterwards.
+    """
+    mapping = route.get("model_map") or {}
+    if not body or not mapping:
+        return body, None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return body, None
+    if not isinstance(data, dict):
+        return body, None
+    wanted = data.get("model")
+    if not isinstance(wanted, str) or not wanted:
+        return body, None
+    target = mapping.get(wanted) or mapping.get("*")
+    if not target or target == wanted:
+        return body, None
+    data["model"] = target
+    return json.dumps(data, ensure_ascii=False).encode("utf-8"), target
+
+
 def adapt_model(body, pid, route):
     """Swap the requested model for the newest one this relay does serve."""
     if not body or route.get("auth_type") == "oauth":
@@ -1497,6 +1546,8 @@ def adapt_model(body, pid, route):
     wanted = data.get("model")
     if not isinstance(wanted, str) or not wanted:
         return body
+    if route.get("model_map"):
+        return body                       # explicit mapping handled by the caller
 
     ids = route_models(pid, route)
     if not ids or wanted in ids:
@@ -1769,8 +1820,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     row_note = row["price_note"] or ""
                 note_extra = ""
+                if row.get("fixed_price"):
+                    note_extra = "固定单价"
                 if row.get("balance") is not None:
-                    note_extra = "余额 $%.2f" % row["balance"]
+                    note_extra = (note_extra + " · " if note_extra else "") + "余额 $%.2f" % row["balance"]
                 if row.get("affinity"):
                     note_extra = ((note_extra + " · " if note_extra else "")
                                   + "会话粘住×%d" % row.get("affinity_sessions", 1))
@@ -1906,8 +1959,14 @@ class Handler(BaseHTTPRequestHandler):
             if route.get("auth_type") == "oauth":
                 attempt_body = normalize_for_official(request_body)
             else:
-                # fit the model to what this relay actually serves
-                attempt_body = adapt_model(request_body, pid, route)
+                # fit the model to what this relay actually serves: an explicit
+                # per-route mapping first, then /v1/models guessing
+                attempt_body, mapped = apply_model_map(request_body, pid, route)
+                if mapped:
+                    log("MAP   %s: %s -> %s (route model_map)"
+                        % (route["name"], wanted, mapped))
+                else:
+                    attempt_body = adapt_model(request_body, pid, route)
             if attempt_body is not request_body:
                 headers["Content-Length"] = str(len(attempt_body))
 

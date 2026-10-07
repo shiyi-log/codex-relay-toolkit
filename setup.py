@@ -53,6 +53,10 @@ AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
 # of subdirectories) becomes its own fallback route, so a spent account can sit
 # out while another one serves.
 OAUTH_DIRS = os.environ.get("BRIDGE_OAUTH_DIRS", "~/.codex")
+# Sidecars: a local Responses<->Chat-Completions translator (codex-relay) per
+# chat-only upstream. Declared in sidecars.json, started by sidecar.py, merged
+# into routes.json here so the bridge treats them as ordinary relays.
+SIDECARS_FILE = os.environ.get("BRIDGE_SIDECARS", os.path.join(BASE_DIR, "sidecars.json"))
 OFFICIAL_ATTEMPTS = int(os.environ.get("BRIDGE_OFFICIAL_ATTEMPTS", "10"))
 MOUNT_RE = re.compile(r"/p/([0-9a-fA-F]{8}-[0-9a-fA-F-]{4,})")
 BASE_URL_RE = re.compile(r'base_url\s*=\s*"([^"]+)"')
@@ -69,6 +73,46 @@ def load_json(path, default):
         except Exception:
             pass
     return default
+
+
+def load_sidecars():
+    """-> [dict] from sidecars.json ({"relays": [...]}); [] when absent."""
+    data = load_json(SIDECARS_FILE, {})
+    relays = data.get("relays") if isinstance(data, dict) else None
+    return relays if isinstance(relays, list) else []
+
+
+def sidecar_route(entry):
+    """One sidecars.json entry -> (route_id, route dict) or (None, reason)."""
+    sid = str(entry.get("id") or "").strip()
+    port = entry.get("port")
+    upstream = str(entry.get("upstream") or "").strip()
+    if not sid:
+        return None, "missing id"
+    if not isinstance(port, int) or not (1024 <= port <= 65535):
+        return None, "missing/invalid port"
+    if not upstream:
+        return None, "missing upstream"
+    if not entry.get("api_key"):
+        print("  WARN  sidecar %s has no api_key" % sid)
+    price = entry.get("price_per_m")
+    try:
+        price = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price = None
+    route = {
+        "mount": "/p/sidecar-%s" % sid,
+        "prefix": "/v1",                 # codex-relay serves /v1/responses
+        "upstream": "http://127.0.0.1:%d" % port,
+        "name": str(entry.get("name") or ("sidecar:%s" % sid)),
+        "auth": "",                      # the sidecar holds the real upstream key
+        "original_base_url": "sidecar:%s" % sid,
+    }
+    if isinstance(entry.get("model_map"), dict) and entry["model_map"]:
+        route["model_map"] = entry["model_map"]
+    if price is not None:
+        route["price_per_m"] = price
+    return "sidecar-%s" % sid, route
 
 
 def discover_accounts():
@@ -420,8 +464,26 @@ def main():
         print("  %s %d provider(s) deleted in CC Switch out of originals.json"
               % ("[dry-run] would drop" if DRY_RUN else "dropped", len(dropped)))
 
+    # sidecar relays (chat-completions-only upstreams behind codex-relay)
+    sidecar_pids = []
+    for entry in load_sidecars():
+        rid, route = sidecar_route(entry)
+        if not rid:
+            print("  skip sidecar %r (%s)" % (entry.get("id"), route))
+            continue
+        new_routes[rid] = route
+        sidecar_pids.append(rid)
+        mapped = route.get("model_map") or {}
+        price = route.get("price_per_m")
+        print("  SIDE  %-40s port %-6s -> %s%s%s"
+              % (route["name"][:40], entry.get("port"), entry.get("upstream"),
+                 "  [map %s]" % ",".join("%s->%s" % kv for kv in list(mapped.items())[:3])
+                 if mapped else "",
+                 "  [$%.3f/M]" % price if price else ""))
+
     # round-robin order == CC Switch's failover priority, official account last
-    order = [r[0] for r in rows if r[0] in new_routes] + official_pids
+    order = ([r[0] for r in rows if r[0] in new_routes]
+             + sidecar_pids + official_pids)
 
     if DRY_RUN:
         print("\n[dry-run] routes.json / CC Switch not touched. Drop --dry-run to apply.")

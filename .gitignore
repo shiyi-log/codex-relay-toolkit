@@ -32,3 +32,8 @@ bridge-requests.jsonl.1
 attribution-state.json
 attribution-changelog.jsonl
 attribution-changelog.jsonl.rolled-back
+# sidecar runtime
+sidecars.json
+bin/
+run/
+sidecar-*.log

@@ -277,6 +277,44 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
 > 风险最低；若希望桥主动刷新，建议给桥一个独立的 `CODEX_HOME`
 > （`BRIDGE_OAUTH_DIRS=/path/to/bridge-codex`，在那里单独 `codex login` 一次）。
 
+### 接入只支持 Chat Completions 的渠道（sidecar）
+
+我们的桥讲 **Responses API**（Codex 用的协议），而不少便宜渠道（DeepSeek、Kimi、Qwen、GLM、
+OpenRouter 上的很多模型…）只讲 **Chat Completions**。这类渠道用
+[codex-relay](https://github.com/MetaFARS/codex-relay) 做**单向翻译**：
+一个上游起一个 sidecar，我们把它当成**普通中转**接进池子 —— **它只翻译，价格/延迟排序、
+故障转移、熔断、会话粘性仍然全在桥里**（codex-relay 自己没有重试、没有超时、
+会话状态只在进程内，正好互补）。
+
+```bash
+python3 sidecar.py --install        # 从 PyPI 的 wheel 里取出 codex-relay 可执行文件
+cp sidecars.example.json sidecars.json && $EDITOR sidecars.json
+python3 sidecar.py --start          # 按配置拉起每个 sidecar（含 pid 文件与日志）
+python3 setup.py                    # 把它们合并进 routes.json
+python3 sidecar.py --status         # 看 pid / 端口 / 上游 / 探活
+```
+
+`sidecars.json` 每条：
+
+| 字段 | 说明 |
+|---|---|
+| `id` / `name` | 路由标识与显示名（路由 id 会变成 `sidecar-<id>`）|
+| `port` | sidecar 监听端口（`127.0.0.1`）|
+| `upstream` | 该渠道的 chat-completions base，例如 `https://api.deepseek.com/v1` |
+| `api_key` | 该渠道的 key（**只交给 sidecar**，桥里是空的）|
+| `model_map` | 把客户端的模型名改写成上游认的名字，`{"gpt-6.1-sol": "kimi-k2", "*": "deepseek-chat"}` |
+| `price_per_m` | 固定单价（$/加权百万 token）：chat-only 上游没有 `/v1/usage`，靠它参与排序与成本统计 |
+| `extra_params` / `drop_params` | 透传给 codex-relay 的额外/要删除的上游参数 |
+
+桥侧为此加了两件事：**`model_map`**（显式映射优先于按 `/v1/models` 猜测）和
+**`price_per_m`**（固定单价，`/__bridge/status` 里标 `固定单价`）。
+
+> **已知边界**（都来自对 codex-relay 的源码核实）：它的 `previous_response_id` 会话状态**在进程内**，
+> 跨 sidecar 切换会丢上下文 —— 我们的**会话粘性**正好保证一轮对话不中途换家；
+> sidecar 重启则无法避免地丢该会话历史（桥感知不到，表现为上游报错或上下文缺失）。
+> 它在“上游没返回 usage”时会静默记 0，我们的成本列会是空的而不是 0 误报。
+> 它自身没有超时/重试：首字节与流停滞由桥的看门狗负责。
+
 ### 安装
 
 ```bash
@@ -350,6 +388,8 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXPLORE_PRICE_FACTOR` | `2.0` | 探索只挑「最便宜的几倍」以内的中转（`0` = 不限价格）|
 | `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
 | `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
+| `BRIDGE_SIDECARS` | `<脚本目录>/sidecars.json` | sidecar 清单（setup.py 与 sidecar.py 都读它）|
+| `BRIDGE_CODEX_RELAY` | `<脚本目录>/bin/codex-relay` | codex-relay 可执行文件路径 |
 | `BRIDGE_MIN_BALANCE` | `1.0` | 余额低于这个数（美元）就 park 该中转 |
 | `BRIDGE_BALANCE_HOLD` | `3600` | 余额不足时的 park 时长 |
 | `BRIDGE_UNLIMITED_BALANCE` | `1000000` | 大于此值视为"无限制"，不参与余额判断 |

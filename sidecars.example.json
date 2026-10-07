@@ -1,0 +1,24 @@
+{
+  "_comment": "每条 = 一个只支持 Chat Completions 的上游，由 codex-relay 翻译成 Responses。复制成 sidecars.json 后：python3 sidecar.py --start && python3 setup.py",
+  "relays": [
+    {
+      "id": "deepseek",
+      "name": "DeepSeek 直连",
+      "port": 15901,
+      "upstream": "https://api.deepseek.com/v1",
+      "api_key": "sk-REPLACE_ME",
+      "model_map": { "*": "deepseek-chat" },
+      "price_per_m": 0.28
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi 直连",
+      "port": 15902,
+      "upstream": "https://api.moonshot.cn/v1",
+      "api_key": "sk-REPLACE_ME",
+      "model_map": { "gpt-6.1-sol": "kimi-k2-turbo-preview", "*": "kimi-k2-turbo-preview" },
+      "price_per_m": 1.11,
+      "extra_params": { "temperature": 0.3 }
+    }
+  ]
+}

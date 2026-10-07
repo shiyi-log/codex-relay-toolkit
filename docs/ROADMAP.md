@@ -50,8 +50,14 @@ LiteLLM 的 `cost-based-routing` 用**静态价格表**、延迟用**全局平�
    轮换 token 读-改-写回 `auth.json`（0600）、跨进程 flock + 刷新前重读（避免与 Codex app
    互相作废 token）、`BRIDGE_OAUTH_DIRS` 下的账号各自成一条兜底路由、
    `x-codex-*` 响应头配额直接进熔断与状态页。
-2. **配额感知路由**：兜底账号的 `x-codex-primary/secondary-used-percent`、`reset-at` 直接进排序；`usage_limit_reached` 时把该账号 park 到重置时间（熔断的 quota 分支已经准备好了）。
-3. **协议转换 = 组合而非重写**：Chat-Completions-only 的渠道（Kimi/Qwen/GLM 等）用 `codex-relay` 起一个 sidecar（一个 provider 一个端口），在我们这里注册成普通路由。**注意其 `previous_response_id` 会话存储在实例内**：跨实例故障转移会静默丢上下文，所以要么只在轮次边界切换，要么接受损失。
+2. ~~**配额感知路由**~~ **已完成**：账号的 `x-codex-*` 响应头（用量/重置/套餐/额度）
+   直接进熔断与状态页，`usage_limit_reached` park 到重置时间。
+3. ~~**协议转换 = 组合而非重写**~~ **已完成**：`sidecar.py --install/--start/--status/--stop`
+   管理 codex-relay sidecar，`setup.py` 把它们合并成普通路由；桥侧新增 **`model_map`**
+   （显式映射优先于 /v1/models 猜测）与 **`price_per_m`**（chat-only 上游没有 /v1/usage，
+   靠固定单价参与排序与成本）。端到端用**真实 codex-relay 二进制 + 只讲 chat-completions
+   的假上游**验证通过（`tests/test_sidecars.py`）。注意其 `previous_response_id` 会话状态
+   在进程内 —— 会话粘性保证一轮对话不中途换家；sidecar 重启会丢历史。
 4. ~~**会话粘性**~~ **已完成**：按 session-id / thread-id / prompt_cache_key /
    instructions+首项哈希认出会话，给上一回合的中转加 0.75 分加成（不是硬钉死，
    明显更优的中转照样赢；被熔断立刻放弃）；有粘性时预热与探索让路。
