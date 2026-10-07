@@ -417,6 +417,39 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
   而不是假定存在。2026-10-07 就是因为 `record_attempt` 直接取 `lat_by_model` 抛 KeyError，
   被重试循环当成"该中转失败"，把所有人的失败率推到 0.6–0.8（`tests/test_scoring_v2.py` 里有回归用例）。
 
+### 订阅额度配速：不能一次用完，也不能到期没用
+
+订阅额度是**会过期的资源**：窗口一结束，没用完的部分就作废；可一次用光，后面就没有兜底了。
+所以桥把账号额度当成" perishable "的资源来配速，而不是简单地"永远排最后"。
+
+**数据来源**：`GET https://chatgpt.com/backend-api/wham/usage`（**不消耗额度**）拿到
+`plan_type` / 窗口长度 / `used_percent` / 重置时间，每 `BRIDGE_QUOTA_TTL`（默认 10 分钟）探测一次。
+同一份响应里带着账号邮箱，**只取限额字段，绝不保存或打印**（有测试守着）。
+
+**配速线**：`应该已用 = 100% × 窗口已过时间 ÷ 窗口总长`，与真实 `used_percent` 比：
+
+| 状态 | 判定 | 行为 |
+|---|---|---|
+| **落后** | 实际 < 目标 − `DEADBAND`(5%) | **主动用账号**：按份额提到队首（默认 1/4；落后越多越高，上限 1/2）—— 预付的钱不用就是浪费 |
+| **临近重置仍有额度** | 距重置 ≤ `FINAL_DAYS`(1 天) 且还剩 ≥ `FINAL_MIN`(20%) | 份额拉到 **1.0**：use it or lose it |
+| **正常** | 在 ±DEADBAND 内 | 维持原样：**只在别家都失败时兜底** |
+| **超前** | 实际 > 目标 + DEADBAND | **不兜底**：留给后面的天数，避免"前几天就用光" |
+
+**权威来源优先**：探测数据在 30 分钟内优先于响应头派生的字段。响应头里的
+`reset-after-seconds` 可能是 0 或离谱值，曾经把"还剩 0 天"喂给 final push，
+导致**每个请求都先用账号**（正好是要避免的失控）——现在 final push 只在
+"来源=探测 且 窗口/重置自洽"时才生效，并有用例覆盖。
+
+状态页会写明当前状态，例如：
+
+```
+OpenAI Official (我的账号)  oauth 账号，额度 1%/目标 6%（落后→主动用掉，约每 4 个请求用 1 次），
+                           已用 1%，157.9h后重置
+```
+
+实测（刚部署时）：账号用量 0% → 1%，近 5 分钟 **29/123（24%）** 的请求由账号承担，
+其余仍走便宜中转 —— 额度在按天均匀消耗，而不是躺着过期。
+
 ### 别让流量悄悄绕过桥（`takeover.py`）
 
 **这是最容易踩、也最难察觉的一种失效**：桥一重启（部署、崩溃、休眠唤醒），
@@ -583,6 +616,16 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_TAKEOVER_RESTART_COOLDOWN` | `900` | 两次自动重启 CC Switch 之间的最小间隔 |
 | `BRIDGE_SIDECARS` | `<脚本目录>/sidecars.json` | sidecar 清单（setup.py 与 sidecar.py 都读它）|
 | `BRIDGE_CODEX_RELAY` | `<脚本目录>/bin/codex-relay` | codex-relay 可执行文件路径 |
+| `BRIDGE_QUOTA_PACE` | `1` | 订阅额度配速总开关 |
+| `BRIDGE_QUOTA_TTL` | `600` | 额度探测间隔（秒）|
+| `BRIDGE_QUOTA_DEADBAND` | `5` | 领先/落后多少个百分点才算偏离配速线 |
+| `BRIDGE_QUOTA_CATCHUP_SHARE` | `0.25` | 落后时主动用账号的份额 |
+| `BRIDGE_QUOTA_CATCHUP_MAX` | `0.5` | 落后很多时的份额上限 |
+| `BRIDGE_QUOTA_FINAL_DAYS` | `1.0` | 距重置多少天内进入"最后冲刺" |
+| `BRIDGE_QUOTA_FINAL_MIN` | `20` | 剩多少百分点才值得冲刺 |
+| `BRIDGE_QUOTA_EXPIRES` | 空 | 硬到期日（`YYYY-MM-DD` 或 epoch），比窗口重置更早时用它压缩窗口 |
+| `BRIDGE_QUOTA_WINDOW` | `604800` | 窗口长度兜底值（响应头来源没有窗口长度时用）|
+| `BRIDGE_QUOTA_USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` | 额度探测地址 |
 | `BRIDGE_MIN_BALANCE` | `1.0` | 余额低于这个数（美元）就 park 该中转 |
 | `BRIDGE_BALANCE_HOLD` | `3600` | 余额不足时的 park 时长 |
 | `BRIDGE_UNLIMITED_BALANCE` | `1000000` | 大于此值视为"无限制"，不参与余额判断 |

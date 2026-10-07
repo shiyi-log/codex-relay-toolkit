@@ -357,7 +357,7 @@ class AccountFlowTest(unittest.TestCase):
             "http://127.0.0.1:%d/__bridge/status" % self.port, timeout=5).read())
         row = [r for r in snap["routes"] if r["id"] == "acct"][0]
         self.assertEqual(row["quota"]["used_percent"], 100)
-        self.assertEqual(row["quota"]["plan_type"], "plus")
+        self.assertEqual(row["quota"]["plan"], "plus")   # unified snapshot field
         self.assertEqual(row["breaker"], "open")
         self.assertEqual(row["last_error"], "quota")
 

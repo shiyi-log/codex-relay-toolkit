@@ -520,13 +520,53 @@ def parse_quota_headers(headers):
             "ts": time.time(), "windows": windows}
 
 
+def store_quota(pid, fields, source="headers"):
+    """Merge quota fields into one snapshot.
+
+    Two sources feed this: the response headers (`note_quota`, cheap but without
+    the window length, and their reset field can be 0/nonsense) and the backend
+    probe (`quota_probe`, authoritative but rate-limited). Rules:
+
+    * a **fresh probe** wins on the schedule fields (window / reset / plan) -
+      a bogus header reset once looked like "expires right now", which triggered
+      the final push and would have spent the account on *every* request;
+    * headers still refresh `used_percent`, which moves between probes.
+    """
+    now = time.time()
+    with _stats_lock:
+        b = _bucket(pid)
+        snap = dict(b.get("quota") or {})
+        probe_fresh = (snap.get("source") == "probe"
+                       and now - (snap.get("probe_ts") or 0) < QUOTA_TTL * 3)
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if source == "headers" and probe_fresh and key in (
+                    "window_s", "reset_in_s", "plan"):
+                continue
+            snap[key] = value
+        snap.setdefault("window_s", QUOTA_WINDOW_DEFAULT)
+        snap["source"] = "probe" if source == "probe" else snap.get("source", "headers")
+        if source == "probe":
+            snap["probe_ts"] = fields.get("usage_ts") or now
+        snap["usage_ts"] = fields.get("usage_ts") or now
+        snap["ts"] = snap["usage_ts"]
+        b["quota"] = snap
+        return snap
+
+
 def note_quota(pid, headers):
     """Store the account quota snapshot and park the account when it is spent."""
     snap = parse_quota_headers(headers)
     if not snap:
         return None
-    with _stats_lock:
-        _bucket(pid)["quota"] = snap
+    snap = store_quota(pid, {
+        "used_percent": snap.get("used_percent"),
+        "reset_in_s": snap.get("reset_after_s"),
+        "plan": snap.get("plan_type"),
+        "credits": snap.get("credits"),
+        "window_s": None,                     # headers do not carry it
+    }) or snap
     if snap["used_percent"] >= 100:
         breaker_charge(pid, "quota", reset=snap.get("reset_after_s"))
     else:
@@ -632,6 +672,34 @@ SLOW_STREAK_TTL = float(os.environ.get("BRIDGE_SLOW_STREAK_TTL", "300"))
 # least this share of BRIDGE_SLOW_TTFB is charged as slow *in addition* to the
 # failure, so "fails slowly" is worse than "fails fast".
 SLOW_WASTE_FACTOR = float(os.environ.get("BRIDGE_SLOW_WASTE_FACTOR", "0.5"))
+# ------------------------------------------------ subscription quota pacing
+# The subscription allowance is a *perishable* resource: it resets (and unused
+# allowance is lost) at the end of the window. Never spend it all at once, never
+# let it expire unused - so pace it against an even spend of the window:
+#   should_have_used = 100% x elapsed / window
+# ahead  -> stop falling back to the account (keep it for later days)
+# behind -> actively use it (it is prepaid, and expiring quota is wasted money)
+QUOTA_PACE = os.environ.get("BRIDGE_QUOTA_PACE", "1") != "0"
+QUOTA_TTL = float(os.environ.get("BRIDGE_QUOTA_TTL", "600"))
+QUOTA_DEADBAND = float(os.environ.get("BRIDGE_QUOTA_DEADBAND", "5"))       # % points
+QUOTA_CATCHUP_SHARE = float(os.environ.get("BRIDGE_QUOTA_CATCHUP_SHARE", "0.25"))
+QUOTA_CATCHUP_MAX = float(os.environ.get("BRIDGE_QUOTA_CATCHUP_MAX", "0.5"))
+QUOTA_FINAL_DAYS = float(os.environ.get("BRIDGE_QUOTA_FINAL_DAYS", "1.0"))
+QUOTA_FINAL_MIN = float(os.environ.get("BRIDGE_QUOTA_FINAL_MIN", "20"))    # % points
+QUOTA_EXPIRES = 0.0
+_exp = os.environ.get("BRIDGE_QUOTA_EXPIRES", "").strip()
+if _exp:
+    try:
+        QUOTA_EXPIRES = float(_exp) if _exp.replace(".", "").isdigit() else time.mktime(
+            time.strptime(_exp, "%Y-%m-%d"))
+    except Exception:
+        QUOTA_EXPIRES = 0.0
+QUOTA_TIMEOUT = float(os.environ.get("BRIDGE_QUOTA_TIMEOUT", "20"))
+# the prolite plan's window; used when only header data (which lacks the window
+# length) is available, so pacing still works from either source
+QUOTA_WINDOW_DEFAULT = float(os.environ.get("BRIDGE_QUOTA_WINDOW", str(604800)))
+QUOTA_USAGE_URL = os.environ.get("BRIDGE_QUOTA_USAGE_URL",
+                                 "https://chatgpt.com/backend-api/wham/usage")
 MODEL_ADAPT_PENALTY = float(os.environ.get("BRIDGE_MODEL_ADAPT_PENALTY", "0.4"))
 MODEL_MISSING_PENALTY = float(os.environ.get("BRIDGE_MODEL_MISSING_PENALTY", "1.5"))
 EWMA_ALPHA = float(os.environ.get("BRIDGE_EWMA_ALPHA", "0.3"))
@@ -748,6 +816,7 @@ TOKEN_WEIGHTS = {"input_tokens": 1.0, "output_tokens": 4.0,
 _stats_lock = threading.Lock()
 _stats = {}       # pid -> {"lat", "ok", "fail", "samples", "ts", "lat_ts", "byhour"}
 _prices = {}      # pid -> {"ts", "per_model", "overall", "trend", "error"}
+_pace = {"n": 0}      # request counter used to spread catch-up promotions
 _last_plan = {"order": [], "signature": ""}
 _explore = {"n": 0}
 _affinity = {}     # conversation key -> (pid, last seen)   [session stickiness]
@@ -1509,6 +1578,25 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 ordered.remove(pid)
                 ordered.insert(0, pid)
                 log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
+    quota_note = None
+    if oauth and QUOTA_PACE and ORDER_MODE != "fixed" and remember:
+        acct = oauth[0]
+        pace = quota_pace(acct)
+        if pace["state"] == "ahead" and not breaker_open(acct):
+            # spending faster than the window allows: keep the rest for later days
+            oauth = []
+            quota_note = "ahead"
+            log("QUOTA ahead: %s - 不兜底，留给后面的天数（%s）"
+                % (routes_name(acct), pace["reason"]))
+        elif pace["state"] == "behind" and pace["share"] > 0 and not breaker_open(acct):
+            every = 1 if pace["share"] >= 1 else max(2, int(round(1.0 / pace["share"])))
+            _pace["n"] += 1
+            if every == 1 or _pace["n"] % every == 0:
+                ordered = [acct] + ordered          # prepaid and perishable: use it
+                oauth = []
+                quota_note = "behind"
+                log("QUOTA behind: %s - 这次主动用账号（%s，约每 %d 个请求 1 次）"
+                    % (routes_name(acct), pace["reason"], every))
     ordered = ordered + oauth
     if ORDER_MODE != "fixed":
         # a parked relay (breaker open) is tried last - including parked
@@ -1551,6 +1639,113 @@ def log_plan(ordered, scores, model, sticky=None):
         parts.append("%s[%s %s fail%.2f p%.1f]"
                      % (pid[:8], price, lat, s["fail_rate"], s["score"]))
     log("ORDER %s -> %s" % (model or "(no model)", " > ".join(parts)))
+
+
+def quota_probe(route, force=False):
+    """Read the account's allowance straight from the backend (no quota spent).
+
+    `GET /backend-api/wham/usage` answers with the window, used_percent and the
+    reset time, which is exactly what pacing needs. Only rate-limit fields are
+    kept - the same body carries the account email, which must never be stored
+    or logged.
+    """
+    if not route or route.get("auth_type") != "oauth":
+        return None
+    pid = route.get("_pid") or ""
+    now = time.time()
+    with _stats_lock:
+        cached = dict((_stats.get(pid) or {}).get("quota") or {})
+    if not force and cached.get("usage_ts") and now - cached["usage_ts"] < QUOTA_TTL:
+        return cached
+    cred = load_oauth(route.get("auth_file") or "")
+    if not cred:
+        return None
+    token, account_id, _exp, _fp = cred
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/json",
+               "User-Agent": "ccswitch-retry-bridge/1.4"}
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    try:
+        req = urllib.request.Request(QUOTA_USAGE_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=QUOTA_TIMEOUT) as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        with _stats_lock:
+            b = _bucket(pid)
+            b["quota_error"] = str(exc)[:80]
+        return None
+    limit = (data.get("rate_limit") or {})
+    window = limit.get("primary_window") or {}
+    snap = {
+        "usage_ts": now, "ts": now,
+        "plan": data.get("plan_type"),
+        "allowed": limit.get("allowed"),
+        "limit_reached": bool(limit.get("limit_reached")),
+        "used_percent": window.get("used_percent"),
+        "window_s": window.get("limit_window_seconds"),
+        "reset_in_s": window.get("reset_after_seconds"),
+        "reset_at": window.get("reset_at"),
+        "credits": ((data.get("credits") or {}).get("balance")),
+        "model_usage": {k: {"available": (v or {}).get("available")}
+                        for k, v in (data.get("model_usage") or {}).items()},
+    }
+    snap = store_quota(pid, snap, source="probe")
+    with _stats_lock:
+        _bucket(pid).pop("quota_error", None)
+    log("QUOTA probe: plan=%s used=%.1f%% window=%.1fd reset in %.2fd"
+        % (snap["plan"], snap["used_percent"] or 0,
+           (snap["window_s"] or 0) / 86400.0, (snap["reset_in_s"] or 0) / 86400.0))
+    if snap["limit_reached"]:
+        breaker_charge(pid, "quota", reset=snap.get("reset_in_s"))
+    return snap
+
+
+def quota_pace(pid, now=None):
+    """Where this account stands against an even spend of its window."""
+    now = now or time.time()
+    with _stats_lock:
+        q = dict((_stats.get(pid) or {}).get("quota") or {})
+    out = {"state": "unknown", "used_percent": None, "target_percent": None,
+           "reset_in_s": None, "window_s": None, "days_left": None,
+           "plan": q.get("plan"), "share": 0.0, "reason": "no quota data"}
+    window = float(q.get("window_s") or QUOTA_WINDOW_DEFAULT)
+    reset_in = float(q.get("reset_in_s") or 0)
+    used = q.get("used_percent")
+    if used is None:
+        return out
+    if QUOTA_EXPIRES:
+        left = max(0.0, QUOTA_EXPIRES - now)
+        if left < reset_in:
+            reset_in, out["reason"] = left, "expiry deadline"
+    elapsed = max(0.0, window - reset_in)
+    should = 100.0 * min(1.0, elapsed / window)
+    diff = float(used) - should
+    out.update({"used_percent": round(float(used), 1),
+                "target_percent": round(should, 1),
+                "reset_in_s": int(reset_in), "window_s": int(window),
+                "days_left": round(reset_in / 86400.0, 2),
+                "remaining_percent": round(max(0.0, 100.0 - float(used)), 1)})
+    if diff < -QUOTA_DEADBAND:
+        out["state"] = "behind"
+        ratio = min(3.0, abs(diff) / max(QUOTA_DEADBAND, 1e-6))
+        out["share"] = min(QUOTA_CATCHUP_MAX, QUOTA_CATCHUP_SHARE * max(1.0, ratio))
+        out["reason"] = "used %.1f%% < target %.1f%%" % (used, should)
+        if not q.get("source") == "probe":
+            out["reason"] += "（数据来自响应头，按保守配速）"
+    elif diff > QUOTA_DEADBAND:
+        out["state"] = "ahead"
+        out["reason"] = "used %.1f%% > target %.1f%%" % (used, should)
+    else:
+        out["state"] = "on-track"
+        out["reason"] = "used %.1f%% ~ target %.1f%%" % (used, should)
+    trustworthy = (q.get("source") == "probe" and 0 < reset_in <= window * 1.02)
+    if (out["state"] == "behind" and trustworthy and out["days_left"] is not None
+            and out["days_left"] <= QUOTA_FINAL_DAYS
+            and out.get("remaining_percent", 0) >= QUOTA_FINAL_MIN):
+        out["share"] = 1.0                     # expiry is close: use it or lose it
+        out["reason"] += " · %.1fd to reset, %.0f%% left → final push" % (
+            out["days_left"], out["remaining_percent"])
+    return out
 
 
 def routes_name(pid):
@@ -1618,14 +1813,23 @@ def status_snapshot(routes, base_order, model):
         })
         if route.get("auth_type") == "oauth":
             quota = b.get("quota") or {}
+            pace = quota_pace(pid, now)
+            rows[-1]["pace"] = {
+                "state": pace["state"], "used_percent": pace["used_percent"],
+                "target_percent": pace["target_percent"], "share": round(pace["share"], 3),
+                "days_left": pace["days_left"], "remaining_percent": pace.get("remaining_percent"),
+                "reason": pace["reason"], "plan": pace.get("plan"),
+                "probe_age_s": (int(now - quota["usage_ts"]) if quota.get("usage_ts") else None),
+            }
             creds = load_oauth(route.get("auth_file") or "")
             rows[-1]["quota"] = ({
-                "used_percent": round(quota.get("used_percent", 0), 1),
-                "plan_type": quota.get("plan_type"),
+                "used_percent": round(quota.get("used_percent") or 0, 1),
+                "plan": quota.get("plan"),
                 "credits": quota.get("credits"),
-                "reset_in_s": (int(quota["reset_after_s"])
-                               if quota.get("reset_after_s") else None),
-                "observed_age_s": int(now - quota.get("ts", now)) if quota else None,
+                "window_days": round((quota.get("window_s") or 0) / 86400.0, 2),
+                "reset_in_s": (int(quota["reset_in_s"])
+                               if quota.get("reset_in_s") else None),
+                "observed_age_s": int(now - quota.get("usage_ts", now)) if quota else None,
             } if quota else None)
             rows[-1]["token_expires_in_s"] = (int(creds[2] - now) if creds and creds[2] else None)
     return {"mode": ORDER_MODE, "respect_start": RESPECT_START,
@@ -1691,6 +1895,22 @@ def prune_state():
     return len(set(removed))
 
 
+def probe_quota_accounts():
+    """Refresh the subscription allowance (cheap, no quota spent)."""
+    if not QUOTA_PACE:
+        return
+    with _state_lock:
+        routes = dict(_state.get("routes") or {})
+    for pid, route in routes.items():
+        if route.get("auth_type") != "oauth":
+            continue
+        route = dict(route, _pid=pid)
+        try:
+            quota_probe(route)
+        except Exception as exc:                                   # pragma: no cover
+            log("QUOTA probe failed: %r" % exc)
+
+
 def housekeeping():
     """Background price refresh + state save. Never touches request handling."""
     while True:
@@ -1699,6 +1919,7 @@ def housekeeping():
                 routes = dict(_state["routes"])
             if routes:
                 refresh_prices(routes)
+                probe_quota_accounts()
                 prune_state()
             save_state()
         except Exception as exc:                                   # pragma: no cover
@@ -2023,7 +2244,17 @@ class Handler(BaseHTTPRequestHandler):
             for row in snap["routes"]:
                 if row["auth_type"] == "oauth":
                     q = row.get("quota")
-                    note = "oauth 账号，固定队尾"
+                    pace = row.get("pace") or {}
+                    note = "oauth 账号"
+                    if pace.get("used_percent") is not None:
+                        label = {"behind": "落后→主动用掉", "ahead": "超前→不兜底",
+                                 "on-track": "配速正常"}.get(pace["state"], pace["state"])
+                        note += "，额度 %.0f%%/目标 %.0f%%（%s%s）" % (
+                            pace["used_percent"], pace["target_percent"], label,
+                            "，约每 %d 个请求用 1 次" % max(2, int(round(1 / pace["share"])))
+                            if pace.get("share") else "")
+                    else:
+                        note += "，固定队尾"
                     if q:
                         note += "，已用 %.0f%%%s" % (q["used_percent"], (
                             "，%s后重置" % _ago(q["reset_in_s"]) if q.get("reset_in_s") else ""))
