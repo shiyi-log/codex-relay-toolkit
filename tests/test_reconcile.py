@@ -29,6 +29,60 @@ class MathTest(unittest.TestCase):
         self.assertAlmostEqual(rc.weighted_million({"input": 2_000_000}), 2.0)
 
 
+class UrlAndAccountTest(unittest.TestCase):
+    def test_url_candidates_cover_the_no_prefix_case(self):
+        urls = rc.usage_urls({"upstream": "https://pp.dog", "prefix": ""})
+        self.assertEqual(urls, ["https://pp.dog/usage", "https://pp.dog/v1/usage"])
+
+    def test_url_candidates_prefer_an_explicit_prefix(self):
+        urls = rc.usage_urls({"upstream": "https://x.test", "prefix": "/v1"})
+        self.assertEqual(urls[0], "https://x.test/v1/usage")
+        self.assertEqual(len(urls), 1)                 # no duplicate candidate
+
+    def test_relays_on_one_host_share_one_account(self):
+        balances = {"pp 特惠": (100.0, "pp.dog"), "pp plus": (100.0, "pp.dog"),
+                    "pp pro": (99.9, "pp.dog"), "wdlink 福利": (50.0, "wdlink.xyz")}
+        accounts = rc.group_accounts(balances)
+        self.assertEqual(len(accounts), 2)             # two wallets, not four
+        labels = rc.account_labels({                     # same labelling as the report
+            "a": {"name": "pp plus", "upstream": "https://pp.dog"},
+            "b": {"name": "pp 特惠", "upstream": "https://pp.dog"},
+            "c": {"name": "pp pro", "upstream": "https://pp.dog"},
+            "d": {"name": "wdlink 福利", "upstream": "https://wdlink.xyz"}})
+        pp_label = [k for k, v in labels.items() if "wdlink" not in v][0]
+        self.assertEqual(accounts[pp_label], 100.0)    # median of the pp values
+        self.assertEqual(accounts["wdlink 福利"], 50.0)
+
+    def test_account_labels_do_not_leak_domains(self):
+        routes = {"a": {"name": "pp 特惠", "upstream": "https://pp.dog"},
+                  "b": {"name": "pp plus", "upstream": "https://pp.dog"}}
+        labels = rc.account_labels(routes)
+        only = list(labels.values())[0]
+        self.assertTrue(only.endswith("等 2 家"), only)
+        self.assertNotIn("pp.dog", only)               # never leak the domain
+
+    def test_legacy_per_relay_samples_are_merged(self):
+        rows = [{"ts": 100.0, "balances": {"pp 特惠": 10.0}},
+                {"ts": 100.0, "balances": {"pp plus": 10.0}},
+                {"ts": 100.0, "balances": {"wdlink 福利": 5.0}}]
+        old = rc.ROUTES
+        import tempfile, json as _json
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "routes.json")
+        with open(path, "w") as fh:
+            _json.dump({"routes": {
+                "a": {"name": "pp 特惠", "upstream": "https://pp.dog"},
+                "b": {"name": "pp plus", "upstream": "https://pp.dog"},
+                "c": {"name": "wdlink 福利", "upstream": "https://wdlink.xyz"}}}, fh)
+        rc.ROUTES = path
+        try:
+            norm = rc.normalize_ledger(rows)
+        finally:
+            rc.ROUTES = old
+        self.assertEqual(len(norm), 1)                 # three lines, one instant
+        self.assertEqual(len(norm[0]["accounts"]), 2)  # two accounts
+
+
 class BridgeWindowTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="reconcile-")
@@ -109,23 +163,33 @@ class LedgerTest(unittest.TestCase):
         rc.LEDGER = self.old
 
     def test_append_and_read_round_trip(self):
-        rc.append_sample({"pp": (100.0, "pp.dog"), "wdlink": (50.0, "wdlink.xyz")},
-                         ts=1000.0)
+        rc.append_sample({"pp 特惠": (100.0, "pp.dog"),
+                          "wdlink 福利": (50.0, "wdlink.xyz")}, ts=1000.0)
         rows = rc.read_ledger()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["balances"], {"pp": 100.0, "wdlink": 50.0})
+        self.assertEqual(rows[0]["accounts"], {"pp 特惠": 100.0, "wdlink 福利": 50.0})
         self.assertEqual(rows[0]["ts"], 1000.0)
 
+    def test_ledger_skips_entries_without_balances(self):
+        """A failed fetch must not enter the series (that once made the report
+        claim "$0.0000 spent" for hours)."""
+        import json as _json
+        with open(rc.LEDGER, "w") as fh:
+            fh.write(_json.dumps({"ts": 1.0}) + "\n")
+            fh.write(_json.dumps({"ts": 2.0, "balances": {}}) + "\n")
+            fh.write(_json.dumps({"ts": 3.0, "accounts": {"pp": 1.0}}) + "\n")
+        self.assertEqual([r["ts"] for r in rc.read_ledger()], [3.0])
+
     def test_account_delta_is_first_minus_last(self):
-        first = {"ts": 1.0, "balances": {"pp": 10.0, "wdlink": 5.0}}
-        last = {"ts": 2.0, "balances": {"pp": 8.5, "wdlink": 4.0}}
+        first = {"ts": 1.0, "accounts": {"pp": 10.0, "wdlink": 5.0}}
+        last = {"ts": 2.0, "accounts": {"pp": 8.5, "wdlink": 4.0}}
         delta = rc.account_delta([first, last], 1.0, 2.0)
         self.assertAlmostEqual(delta["pp"], 1.5)
         self.assertAlmostEqual(delta["wdlink"], 1.0)
 
-    def test_a_new_relay_in_the_last_sample_is_skipped(self):
-        first = {"ts": 1.0, "balances": {"pp": 10.0}}
-        last = {"ts": 2.0, "balances": {"pp": 9.0, "new": 3.0}}
+    def test_a_new_account_in_the_last_sample_is_skipped(self):
+        first = {"ts": 1.0, "accounts": {"pp": 10.0}}
+        last = {"ts": 2.0, "accounts": {"pp": 9.0, "new": 3.0}}
         delta = rc.account_delta([first, last], 1.0, 2.0)
         self.assertEqual(set(delta), {"pp"})
 
