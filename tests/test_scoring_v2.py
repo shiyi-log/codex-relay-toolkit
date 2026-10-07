@@ -159,6 +159,199 @@ class PerModelLatencyTest(unittest.TestCase):
         self.assertEqual(order[0], "b")
 
 
+class FailStreakTest(unittest.TestCase):
+    """A relay that just failed is demoted immediately, not only through the slow
+    failure-rate EWMA and not only once the breaker opens at 5 consecutive
+    failures. The penalty expires, so one bad minute cannot outlive its cause."""
+
+    def setUp(self):
+        bridge_mod._stats.clear()
+        bridge_mod._prices.clear()
+        self.routes = {p: {"name": p.upper()} for p in ("a", "b")}
+        for pid in ("a", "b"):
+            bridge_mod._prices[pid] = {"ts": time.time(), "per_model": {},
+                                       "overall": 0.05, "trend": 1.0, "error": ""}
+
+    def score(self, pid, model=MODEL_A):
+        _order, scores = bridge_mod.plan_order(self.routes, ["a", "b"], None, model)
+        return scores[pid]["score"]
+
+    def test_one_failure_demotes_immediately(self):
+        bridge_mod.record_attempt("a", 5.0, model=MODEL_A)
+        bridge_mod.record_attempt("b", 5.0, model=MODEL_A)
+        before = self.score("a")
+        bridge_mod.breaker_charge("a", "server")
+        after = self.score("a")
+        self.assertAlmostEqual(after - before, bridge_mod.W_FAIL_STREAK, places=6)
+        _order, scores = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)
+        self.assertEqual(_order[0], "b")             # no longer first
+
+    def test_penalty_is_capped(self):
+        for _ in range(10):
+            bridge_mod.breaker_charge("a", "server")
+        _order, scores = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)
+        self.assertEqual(scores["a"]["fails_raw"], 10)
+        self.assertEqual(scores["a"]["streak"], bridge_mod.FAIL_STREAK_CAP)
+        self.assertAlmostEqual(scores["a"]["streak_penalty"],
+                               bridge_mod.W_FAIL_STREAK * bridge_mod.FAIL_STREAK_CAP,
+                               places=6)
+
+    def test_a_success_clears_it(self):
+        bridge_mod.breaker_charge("a", "server")
+        self.assertAlmostEqual(self.score("a"),
+                               self.score("b") + bridge_mod.W_FAIL_STREAK, places=6)
+        bridge_mod.breaker_ok("a")
+        self.assertAlmostEqual(self.score("a"), self.score("b"), places=6)
+
+    def test_a_stale_failure_stops_counting(self):
+        bridge_mod.breaker_charge("a", "server")
+        bridge_mod._stats["a"]["last_fail_ts"] = (
+            time.time() - bridge_mod.FAIL_STREAK_TTL - 1)
+        _order, scores = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)
+        self.assertEqual(scores["a"]["streak_penalty"], 0.0)   # nothing counted
+        self.assertEqual(scores["a"]["streak_decay"], 0.0)
+
+    def test_the_penalty_decays_to_zero(self):
+        bridge_mod.breaker_charge("a", "server")
+        base = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)[1]
+        self.assertAlmostEqual(base["a"]["streak_penalty"], bridge_mod.W_FAIL_STREAK, places=6)
+        bridge_mod._stats["a"]["last_fail_ts"] = (
+            time.time() - bridge_mod.FAIL_STREAK_TTL / 2)
+        half = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)[1]
+        self.assertAlmostEqual(half["a"]["streak_penalty"],
+                               bridge_mod.W_FAIL_STREAK * 0.5, places=1)
+        bridge_mod._stats["a"]["last_fail_ts"] = (
+            time.time() - bridge_mod.FAIL_STREAK_TTL - 1)
+        gone = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)[1]
+        self.assertEqual(gone["a"]["streak_penalty"], 0.0)     # recovered on its own
+        self.assertEqual(gone["a"]["streak_decay"], 0.0)
+
+    def test_probe_interval_grows_with_consecutive_failures(self):
+        now = time.time()
+        bridge_mod.breaker_charge("a", "server")
+        bridge_mod._stats["a"]["attempt_ts"] = now - bridge_mod.PROBE_AFTER - 1
+        self.assertTrue(bridge_mod.probe_due("a", now))
+        bridge_mod._stats["a"]["fails"] = 3
+        self.assertFalse(bridge_mod.probe_due("a", now))          # needs 4x the base
+        bridge_mod._stats["a"]["attempt_ts"] = now - bridge_mod.PROBE_AFTER * 4 - 1
+        self.assertTrue(bridge_mod.probe_due("a", now))
+
+    def test_probe_is_not_due_while_the_breaker_owns_the_schedule(self):
+        now = time.time()
+        for _ in range(bridge_mod.BREAKER_THRESHOLD):
+            bridge_mod.breaker_charge("a", "server")               # -> open
+        bridge_mod._stats["a"]["attempt_ts"] = now - bridge_mod.PROBE_MAX * 2
+        self.assertTrue(bridge_mod.breaker_open("a"))
+        self.assertFalse(bridge_mod.probe_due("a", now))
+
+    def test_a_failing_relay_is_probed_back_to_the_front(self):
+        now = time.time()
+        bridge_mod._prices["a"]["overall"] = 9.0                   # make it unappealing
+        bridge_mod.breaker_charge("a", "server")
+        bridge_mod._stats["a"]["attempt_ts"] = now - bridge_mod.PROBE_AFTER - 5
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A)
+        self.assertEqual(order[0], "a")                            # probed back in
+
+    def test_probe_yields_to_a_sticky_conversation(self):
+        now = time.time()
+        bridge_mod.breaker_charge("a", "server")
+        bridge_mod._stats["a"]["attempt_ts"] = now - bridge_mod.PROBE_AFTER - 5
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b"], None, MODEL_A,
+                                         affinity_pid="b")
+        self.assertEqual(order[0], "b")
+
+    def test_a_client_abort_is_not_a_relay_failure(self):
+        """Closing the client must not charge the relay (otherwise a user hitting
+        Ctrl-C would demote a healthy relay)."""
+        import http.client
+        port = free_port()
+        relay_port = free_port()
+        stop = threading.Event()
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                body = json.dumps({"data": [{"id": MODEL_A}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                while not stop.is_set():            # keep the stream alive
+                    chunk = (b'event: response.output_text.delta\n'
+                             b'data: {"type":"response.output_text.delta",'
+                             b'"delta":"x"}\n\n')
+                    try:
+                        self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+
+            def log_message(self, *a):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", relay_port), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        tmp = tempfile.mkdtemp(prefix="abort-")
+        routes_path = os.path.join(tmp, "routes.json")
+        with open(routes_path, "w") as fh:
+            json.dump({"port": port, "attempts": 2, "order": ["r"],
+                       "routes": {"r": {"mount": "/p/r", "prefix": "", "name": "r",
+                                        "upstream": "http://127.0.0.1:%d" % relay_port,
+                                        "auth": "sk"}}}, fh)
+        env = dict(os.environ, BRIDGE_ROUTES=routes_path, BRIDGE_PORT=str(port),
+                   BRIDGE_STATE=os.path.join(tmp, "state.json"),
+                   BRIDGE_LOG=os.path.join(tmp, "bridge.log"),
+                   BRIDGE_REQUEST_LOG=os.path.join(tmp, "requests.jsonl"),
+                   BRIDGE_VERBOSE="0", BRIDGE_FIRST_BYTE_TIMEOUT="10",
+                   BRIDGE_STREAM_STALL="60")
+        proc = subprocess.Popen([sys.executable, BRIDGE], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    urllib.request.urlopen(
+                        "http://127.0.0.1:%d/__bridge/status" % port, timeout=1).read()
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/p/r/responses",
+                         body=json.dumps({"model": MODEL_A, "stream": True,
+                                          "input": "hi"}),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read(64)                            # start reading, then vanish
+            conn.close()
+            time.sleep(1.5)
+            snapshot = json.loads(urllib.request.urlopen(
+                "http://127.0.0.1:%d/__bridge/status" % port, timeout=5).read())
+            row = snapshot["routes"][0]
+            self.assertEqual(row["consecutive_fails"], 0)
+            self.assertEqual(row["streak"], 0)
+            self.assertEqual(row["breaker"], "closed")
+        finally:
+            stop.set()
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            server.shutdown()
+            server.server_close()
+
+
 class LegacyStateTest(unittest.TestCase):
     """A stats bucket restored from an older bridge-state.json lacks fields added
     later. On 2026-10-07 that turned into KeyError('lat_by_model') inside the

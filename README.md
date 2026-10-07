@@ -113,6 +113,19 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
 * 权重可调：`BRIDGE_W_PRICE`（默认 1.0）、`BRIDGE_W_LATENCY`（默认 **1.5**，速度）、
   `BRIDGE_W_FAIL`（默认 2.0，失败率）。分数是各维度归一化后的加权和，越小越好。
 * 排序用上一次的顺序做稳定排序的种子，分数接近时不会来回抖动。
+* **失败降权（立刻）+ 三重恢复机制**：一味"失败就压低"会让一次偶发失败把好中转钉死，
+  所以降权与恢复是配套的：
+  1. **立刻降权**：每多一次连续失败，分数直接加 `BRIDGE_W_FAIL_STREAK`（默认 1.0，
+     上限 `BRIDGE_FAIL_STREAK_CAP`=3）——不必等缓动的失败率 EWMA，也不必等熔断（5 次）。
+  2. **惩罚随时间线性衰减**：`BRIDGE_FAIL_STREAK_TTL`（默认 900s）内从 1 衰减到 0，
+     即使这个中转一直没被重试，它也会**自己恢复**（不依赖任何请求）。
+  3. **探针保底重试**：连败且超过 `BRIDGE_PROBE_AFTER`（默认 120s）没被尝试 → 直接提到队首试一次；
+     间隔按连败次数**翻倍**（120s→240s→480s…上限 `BRIDGE_PROBE_MAX`=1800s），
+     偶发抖动一分钟内就回来，反复失败的则少打扰但永不放弃。
+  4. **一次成功全清**：`fails`、熔断、冷却、降权全部归零。
+  客户端主动中断（Ctrl-C / 关连接）**不算失败**，不会降权（有端到端用例守着）。
+  状态页会显示 `连败N·降权X(衰减后)·Ns后探针`。
+
 * 官方订阅账号（`auth_type: "oauth"`）**永远排最后**，仍然单独限次。
 * `BRIDGE_ORDER_MODE=fixed` 可以退回原来的行为：从 CC Switch 选中的那家开始轮询。
   `BRIDGE_RESPECT_START=1` 则是「仍然从中转选中那家开始，其余按分数排」。
@@ -437,7 +450,12 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_PRICE_DAYS` | `3` | 趋势参考窗口（仅展示，不影响单价）|
 | `BRIDGE_W_PRICE` | `1.0` | 价格权重 |
 | `BRIDGE_W_LATENCY` | `1.5` | 速度权重 |
-| `BRIDGE_W_FAIL` | `2.0` | 失败率权重 |
+| `BRIDGE_W_FAIL` | `2.0` | 失败率（EWMA）权重 |
+| `BRIDGE_W_FAIL_STREAK` | `1.0` | 每多一次连续失败的立刻降权量 |
+| `BRIDGE_FAIL_STREAK_CAP` | `3` | 连续失败降权的上限倍数 |
+| `BRIDGE_FAIL_STREAK_TTL` | `900` | 降权衰减到 0 的时长（秒）|
+| `BRIDGE_PROBE_AFTER` | `120` | 连败后多久保底重试一次 |
+| `BRIDGE_PROBE_MAX` | `1800` | 探针间隔上限（按连败翻倍）|
 | `BRIDGE_LAT_RING` | `15` | 延迟中位数的样本窗口 |
 | `BRIDGE_LAT_RING_MIN` | `5` | 样本数不足时退回 EWMA |
 | `BRIDGE_MODEL_MIN_SAMPLES` | `5` | 按模型的延迟启用门槛 |

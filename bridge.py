@@ -587,6 +587,24 @@ RESPECT_START = os.environ.get("BRIDGE_RESPECT_START", "0") == "1"
 W_PRICE = float(os.environ.get("BRIDGE_W_PRICE", "1.0"))
 W_LATENCY = float(os.environ.get("BRIDGE_W_LATENCY", "1.5"))
 W_FAIL = float(os.environ.get("BRIDGE_W_FAIL", "2.0"))
+# A relay that just failed is demoted *immediately*, not only through the slow
+# failure-rate EWMA (which needs several failures) nor only once the circuit
+# breaker opens (5 consecutive). One failure costs W_FAIL_STREAK, capped so a
+# relay that is merely unlucky still gets re-tried; a single success clears it.
+W_FAIL_STREAK = float(os.environ.get("BRIDGE_W_FAIL_STREAK", "1.0"))
+FAIL_STREAK_CAP = int(os.environ.get("BRIDGE_FAIL_STREAK_CAP", "3"))
+# ... but a failure must not sideline a relay forever: after this long the streak
+# stops counting against it (it is only about "do not send the next request to a
+# relay that just failed"), so one bad minute cannot outlive its cause.
+FAIL_STREAK_TTL = float(os.environ.get("BRIDGE_FAIL_STREAK_TTL", "900"))
+# Recovery, in two independent mechanisms (one failure must never sideline a
+# relay for good):
+#   * the penalty DECAYS linearly to zero over FAIL_STREAK_TTL, and
+#   * a PROBE re-tries a relay that has been failing but has not been attempted
+#     for a while - the interval doubles per consecutive failure, so a flapping
+#     relay is probed rarely while a transient blip is re-checked in a minute.
+PROBE_AFTER = float(os.environ.get("BRIDGE_PROBE_AFTER", "120"))
+PROBE_MAX = float(os.environ.get("BRIDGE_PROBE_MAX", "1800"))
 MODEL_ADAPT_PENALTY = float(os.environ.get("BRIDGE_MODEL_ADAPT_PENALTY", "0.4"))
 MODEL_MISSING_PENALTY = float(os.environ.get("BRIDGE_MODEL_MISSING_PENALTY", "1.5"))
 EWMA_ALPHA = float(os.environ.get("BRIDGE_EWMA_ALPHA", "0.3"))
@@ -871,6 +889,7 @@ def breaker_charge(pid, kind, retry_after=None, reset=None):
     with _stats_lock:
         b = _bucket(pid)
         b["fails"] = b.get("fails", 0) + 1
+        b["last_fail_ts"] = now
         b["last_error"] = kind
         if kind == "auth":
             b["cooldown"] = BREAKER_AUTH_COOLDOWN
@@ -1231,13 +1250,25 @@ def relay_scores(pids, routes, model, affinity_pid=None):
             l_norm = 1.0
         pen = model_penalty(pid, model)
         bonus = AFFINITY_BONUS if (affinity_pid and pid == affinity_pid) else 0.0
+        streak = int(b.get("fails") or 0)
+        decay = 1.0
+        if streak and FAIL_STREAK_TTL > 0:
+            age = time.time() - (b.get("last_fail_ts") or 0)
+            decay = max(0.0, 1.0 - age / FAIL_STREAK_TTL)   # recovers by itself
+        streak = min(streak, FAIL_STREAK_CAP)
+        streak_pen = W_FAIL_STREAK * streak * decay
         out[pid] = {
             "affinity": bool(bonus),
             "score": (W_PRICE * p_norm + W_LATENCY * l_norm + W_FAIL * fail_rate
-                      + pen - bonus),
+                      + pen + streak_pen - bonus),
             "price_per_m": price, "price_norm": p_norm,
             "latency": lat, "latency_norm": l_norm,
             "fail_rate": fail_rate, "model_penalty": pen,
+            "streak": streak,
+            "fails_raw": int(b.get("fails") or 0),
+            "streak_decay": round(decay, 3),
+            "streak_capped": streak,
+            "streak_penalty": round(streak_pen, 3),
             "exact_model": exact,
             "samples": b.get("samples", 0),
             "error": (_prices.get(pid) or {}).get("error", ""),
@@ -1301,6 +1332,28 @@ def affinity_remember(key, pid, now=None):
         if len(_affinity) > AFFINITY_MAX:
             for stale, _ in sorted(_affinity.items(), key=lambda kv: kv[1][1])[:len(_affinity) - AFFINITY_MAX]:
                 _affinity.pop(stale, None)
+
+
+def probe_due(pid, now=None):
+    """Is a failing relay due for a probe? Interval doubles per failure, so a
+    relay that keeps failing is checked less and less - but never never."""
+    now = now or time.time()
+    b = _stats.get(pid) or {}
+    fails = int(b.get("fails") or 0)
+    if fails <= 0:
+        return False
+    if (b.get("open_until") or 0) > now:
+        return False                     # the breaker owns the schedule while open
+    wait = min(PROBE_MAX, PROBE_AFTER * (2 ** max(0, fails - 1)))
+    return now - last_attempt(pid) >= wait
+
+
+def pick_probe(pids):
+    """The failing relay that has waited longest past its probe interval."""
+    due = [p for p in pids if probe_due(p)]
+    if not due:
+        return None
+    return min(due, key=lambda p: last_attempt(p))
 
 
 def pick_explore(pids, scores):
@@ -1370,6 +1423,9 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
             # long session would freeze the pool and stop adapting.
             pid, why = (None, "")
             if not affinity_pid:
+                # recovery first: a relay that failed is re-checked after a while
+                pid, why = pick_probe(ordered), "PROBE"
+            if pid is None and not affinity_pid:
                 pid, why = pick_warmup(ordered, scores), "WARMUP"
             if pid is None and explore:
                 pid, why = pick_explore(ordered, scores), "EXPLORE"
@@ -1377,6 +1433,9 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 tried = last_attempt(pid)
                 note = ("never tried" if not tried
                         else "last tried %.0fs ago" % (time.time() - tried))
+                if why == "PROBE":
+                    note += ", %d consecutive failure(s)" % (
+                        (_stats.get(pid) or {}).get("fails", 0))
                 ordered.remove(pid)
                 ordered.insert(0, pid)
                 log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
@@ -1468,6 +1527,13 @@ def status_snapshot(routes, base_order, model):
             "model_penalty": s.get("model_penalty"),
             "balance": b.get("balance"),
             "fixed_price": bool(route.get("price_per_m")),
+            "streak": s.get("streak", 0) if s else 0,
+            "streak_penalty": s.get("streak_penalty", 0.0) if s else 0.0,
+            "streak_decay": s.get("streak_decay", 1.0) if s else 1.0,
+            "probe_in_s": (max(0, int(PROBE_AFTER * (2 ** max(0, b.get("fails", 0) - 1))
+                                      - (now - last_attempt(pid))))
+                           if b.get("fails") and not (b.get("open_until") or 0) > now
+                           else None),
             "affinity": sticky.get(pid, 0) > 0,
             "affinity_sessions": sticky.get(pid, 0),
             "breaker": breaker_state(pid),
@@ -1904,8 +1970,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     row_note = row["price_note"] or ""
                 note_extra = ""
+                if row.get("streak"):
+                    note_extra = "连败%d·降权%.1f(衰减后)" % (row["streak"],
+                                                             row.get("streak_penalty", 0))
+                    if row.get("probe_in_s") is not None:
+                        note_extra += "·%ds后探针" % row["probe_in_s"]
                 if row.get("fixed_price"):
-                    note_extra = "固定单价"
+                    note_extra = (note_extra + " · " if note_extra else "") + "固定单价"
                 if row.get("balance") is not None:
                     note_extra = (note_extra + " · " if note_extra else "") + "余额 $%.2f" % row["balance"]
                 if row.get("affinity"):
