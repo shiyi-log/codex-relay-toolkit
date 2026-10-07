@@ -28,6 +28,8 @@ Original base_urls are kept in originals.json; `restore.py` undoes everything.
 Restart CC Switch afterwards so it reloads the URLs.
 """
 
+import glob
+import hashlib
 import json
 import os
 import re
@@ -47,6 +49,10 @@ MARKER = "127.0.0.1:%d/p/" % PORT
 # official ChatGPT Codex backend (subscription login, not api.openai.com)
 OFFICIAL_UPSTREAM = "https://chatgpt.com/backend-api/codex"
 AUTH_FILE = os.path.expanduser("~/.codex/auth.json")
+# Account pool: every auth.json under these dirs (the dir itself plus one level
+# of subdirectories) becomes its own fallback route, so a spent account can sit
+# out while another one serves.
+OAUTH_DIRS = os.environ.get("BRIDGE_OAUTH_DIRS", "~/.codex")
 OFFICIAL_ATTEMPTS = int(os.environ.get("BRIDGE_OFFICIAL_ATTEMPTS", "10"))
 MOUNT_RE = re.compile(r"/p/([0-9a-fA-F]{8}-[0-9a-fA-F-]{4,})")
 BASE_URL_RE = re.compile(r'base_url\s*=\s*"([^"]+)"')
@@ -63,6 +69,31 @@ def load_json(path, default):
         except Exception:
             pass
     return default
+
+
+def discover_accounts():
+    """-> [auth.json paths] from BRIDGE_OAUTH_DIRS (dir itself + one level down)."""
+    out = []
+    for base in OAUTH_DIRS.split(":"):
+        base = os.path.expanduser(base.strip())
+        if not base or not os.path.isdir(base):
+            continue
+        dirs = [base] + sorted(d for d in glob.glob(os.path.join(base, "*"))
+                               if os.path.isdir(d))
+        for directory in dirs:
+            path = os.path.join(directory, "auth.json")
+            if os.path.isfile(path) and path not in out:
+                out.append(path)
+    return out
+
+
+def account_route_id(path):
+    return "oauth-" + hashlib.sha1(path.encode()).hexdigest()[:12]
+
+
+def account_label(path):
+    directory = os.path.dirname(path)
+    return os.path.basename(directory) or directory
 
 
 def upstream_root(url):
@@ -352,6 +383,29 @@ def main():
             official_pids.append(pid)
             print("  LAST  %-40s %s  [oauth, max %d attempts]"
                   % (name[:40], OFFICIAL_UPSTREAM, OFFICIAL_ATTEMPTS))
+
+        # extra subscription accounts (BRIDGE_OAUTH_DIRS): each auth.json gets
+        # its own route so a spent account can be parked while another serves
+        known_files = {os.path.expanduser(r.get("auth_file") or "")
+                       for r in new_routes.values() if r.get("auth_type") == "oauth"}
+        for path in discover_accounts():
+            if os.path.expanduser(path) in known_files:
+                continue
+            rid = account_route_id(path)
+            label = account_label(path)
+            new_routes[rid] = {
+                "mount": "/p/%s" % rid,
+                "prefix": "",
+                "upstream": OFFICIAL_UPSTREAM,
+                "name": "我的账号 (%s)" % label,
+                "auth_type": "oauth",
+                "auth_file": path,
+                "max_attempts": OFFICIAL_ATTEMPTS,
+                "original_base_url": OFFICIAL_UPSTREAM,
+            }
+            official_pids.append(rid)
+            print("  ACCT  %-40s %s  [oauth account, max %d attempts]"
+                  % (label[:40], path, OFFICIAL_ATTEMPTS))
 
     conn.commit()
     conn.close()

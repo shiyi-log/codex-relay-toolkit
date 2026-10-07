@@ -45,7 +45,11 @@ LiteLLM 的 `cost-based-routing` 用**静态价格表**、延迟用**全局平�
 
 ## 下一步（按价值排序）
 
-1. **订阅账号 OAuth 刷新 + 账号池**（照 `thezillo/codex-proxy` 移植）：到期前单飞刷新、401 强制刷新后同账号重试一次、轮换 token 读-改-写回 `auth.json`（0600）、多 `data_dir` 自动发现账号。我们现在只是"每次重读 auth.json"，token 一过期就只能干等。
+1. ~~**订阅账号 OAuth 刷新 + 账号池**（照 `thezillo/codex-proxy` 移植）~~ **已完成**
+   （提交 `fb0e2ee` 之后的一次）：按错误/到期刷新、401 强制刷新后同账号重试一次、
+   轮换 token 读-改-写回 `auth.json`（0600）、跨进程 flock + 刷新前重读（避免与 Codex app
+   互相作废 token）、`BRIDGE_OAUTH_DIRS` 下的账号各自成一条兜底路由、
+   `x-codex-*` 响应头配额直接进熔断与状态页。
 2. **配额感知路由**：兜底账号的 `x-codex-primary/secondary-used-percent`、`reset-at` 直接进排序；`usage_limit_reached` 时把该账号 park 到重置时间（熔断的 quota 分支已经准备好了）。
 3. **协议转换 = 组合而非重写**：Chat-Completions-only 的渠道（Kimi/Qwen/GLM 等）用 `codex-relay` 起一个 sidecar（一个 provider 一个端口），在我们这里注册成普通路由。**注意其 `previous_response_id` 会话存储在实例内**：跨实例故障转移会静默丢上下文，所以要么只在轮次边界切换，要么接受损失。
 4. **会话粘性**：把同一会话（session-id / `prompt_cache_key`）固定到同一个中转，提高 prompt cache 命中（LiteLLM 的 session affinity 思路）。

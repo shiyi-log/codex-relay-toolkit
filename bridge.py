@@ -41,6 +41,7 @@ Config lives in routes.json (written by setup.py). Secrets in it -> file mode 60
 """
 
 import base64
+import hashlib
 import json
 import os
 import random
@@ -314,35 +315,203 @@ def resolve(path):
 
 
 # ------------------------------------------------------------------- oauth auth
-def load_oauth(path):
-    """Read a Codex auth.json (ChatGPT subscription login).
-
-    Returns (access_token, account_id, exp) or None. Read fresh on every attempt
-    on purpose: Codex/CC Switch rotate the token in place, and a cached copy is
-    exactly how you end up sending a revoked token.
-    """
+def read_auth(path):
+    """Read an auth.json without losing anything we do not understand."""
     if not path:
         return None
-    path = os.path.expanduser(path)
     try:
-        with open(path) as fh:
+        with open(os.path.expanduser(path)) as fh:
             data = json.load(fh)
     except Exception:
         return None
-    if data.get("auth_mode") not in (None, "chatgpt"):
+    return data if isinstance(data, dict) else None
+
+
+def auth_fingerprint(data):
+    tokens = (data or {}).get("tokens") or {}
+    raw = (tokens.get("access_token") or tokens.get("refresh_token") or "")
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def jwt_exp(token):
+    """Read `exp` from a JWT payload without trusting it (we only need a clock)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
+    except Exception:
+        return 0
+
+
+def oauth_creds(data):
+    """-> (access_token, account_id, exp, fingerprint) or None."""
+    if not isinstance(data, dict) or data.get("auth_mode") not in (None, "chatgpt"):
         return None
     tokens = data.get("tokens") or {}
     token = tokens.get("access_token")
     if not token:
         return None
-    exp = 0
+    return token, tokens.get("account_id"), jwt_exp(token), auth_fingerprint(data)
+
+
+def load_oauth(path):
+    """Read the account fresh on every attempt (a cached copy is exactly how you
+    end up sending a revoked token). -> creds tuple or None."""
+    return oauth_creds(read_auth(path))
+
+
+def write_auth(path, data):
+    """Atomically persist auth.json at 0600, preserving fields we do not know."""
+    path = os.path.expanduser(path)
+    tmp = "%s.bridge-%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
     try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
-    except Exception:
+        os.chmod(path, 0o600)
+    except OSError:
         pass
-    return token, tokens.get("account_id"), exp
+
+
+_oauth_lock = threading.Lock()
+
+
+def oauth_refresh(path, tried_fingerprint=None, reason="expired"):
+    """Refresh the subscription access token and persist the rotated one.
+
+    Guards, in order: mode off -> no-op; in-process lock; cross-process flock;
+    re-read the file and if another process (the Codex app) already replaced the
+    token we use *theirs* instead of rotating again. The write is
+    read-modify-write so unknown fields and concurrent edits survive.
+    """
+    if OAUTH_REFRESH_MODE == "off" or not path:
+        return None
+    path = os.path.expanduser(path)
+    with _oauth_lock:
+        lock_fd = None
+        try:
+            import fcntl
+            lock_fd = os.open(path + ".bridge-lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except Exception:
+            lock_fd = None
+        try:
+            data = read_auth(path)
+            if not data:
+                return None
+            if tried_fingerprint and auth_fingerprint(data) != tried_fingerprint:
+                log("OAUTH token already replaced by someone else (%s), using it" % reason)
+                return oauth_creds(data)
+            tokens = dict(data.get("tokens") or {})
+            refresh_token = tokens.get("refresh_token")
+            if not refresh_token:
+                return None
+            body = json.dumps({"client_id": OAUTH_CLIENT_ID,
+                               "grant_type": "refresh_token",
+                               "refresh_token": refresh_token}).encode()
+            req = urllib.request.Request(
+                OAUTH_ISSUER.rstrip("/") + "/oauth/token", data=body,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "ccswitch-retry-bridge/1.4"})
+            with urllib.request.urlopen(req, timeout=OAUTH_TIMEOUT) as fh:
+                payload = json.load(fh)
+            access = payload.get("access_token")
+            if not access:
+                log("OAUTH refresh (%s) returned no access_token" % reason)
+                return None
+            fresh = read_auth(path) or data      # read-modify-write
+            merged = dict(fresh.get("tokens") or {})
+            merged["access_token"] = access
+            if payload.get("refresh_token"):
+                merged["refresh_token"] = payload["refresh_token"]
+            if payload.get("id_token"):
+                merged["id_token"] = payload["id_token"]
+            fresh["tokens"] = merged
+            fresh["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_auth(path, fresh)
+            log("OAUTH refreshed (%s) for %s" % (reason, path))
+            return oauth_creds(fresh)
+        except Exception as exc:
+            log("OAUTH refresh failed (%s): %s" % (reason, exc))
+            return None
+        finally:
+            if lock_fd is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                except Exception:
+                    pass
+
+
+def parse_quota_headers(headers):
+    """Quota straight from the response headers - no extra API call.
+
+    The ChatGPT backend reports x-codex-{primary,secondary}-used-percent,
+    -window-minutes, -reset-at / -reset-after-seconds, plus plan type and
+    credits balance.
+    """
+    head = {}
+    for key, value in (headers or []):
+        head[key.lower()] = value
+    windows, worst, worst_reset = {}, None, None
+    for slot in ("primary", "secondary"):
+        pct = head.get("x-codex-%s-used-percent" % slot)
+        if pct is None:
+            continue
+        try:
+            used = float(pct)
+        except (TypeError, ValueError):
+            continue
+        reset = None
+        for key in ("x-codex-%s-reset-after-seconds" % slot,
+                    "x-codex-%s-reset-at" % slot):
+            raw = head.get(key)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            reset = max(0.0, value - time.time()) if "reset-at" in key else max(0.0, value)
+            break
+        minutes = head.get("x-codex-%s-window-minutes" % slot)
+        if str(minutes).strip() in ("0", "0.0"):
+            continue                     # this plan has no such window
+        windows[slot] = {"used_percent": used, "window_minutes": minutes,
+                         "reset_after_s": reset}
+        if worst is None or used > worst:
+            worst, worst_reset = used, reset
+    if worst is None:
+        return None
+    return {"used_percent": worst, "reset_after_s": worst_reset,
+            "plan_type": head.get("x-codex-plan-type"),
+            "credits": head.get("x-codex-credits-balance"),
+            "ts": time.time(), "windows": windows}
+
+
+def note_quota(pid, headers):
+    """Store the account quota snapshot and park the account when it is spent."""
+    snap = parse_quota_headers(headers)
+    if not snap:
+        return None
+    with _stats_lock:
+        _bucket(pid)["quota"] = snap
+    if snap["used_percent"] >= 100:
+        breaker_charge(pid, "quota", reset=snap.get("reset_after_s"))
+    else:
+        with _stats_lock:
+            b = _bucket(pid)
+            still_parked = b.get("last_error") == "quota" and (b.get("open_until") or 0) > time.time()
+        if still_parked:
+            b["last_error"] = ""
+            b["open_until"] = 0
+            b["fails"] = 0
+            log("QUOTA %s reports %.0f%% again - account usable" % (pid, snap["used_percent"]))
+    return snap
 
 
 def normalize_for_official(body):
@@ -444,6 +613,21 @@ BREAKER_AUTH_COOLDOWN = float(os.environ.get("BRIDGE_BREAKER_AUTH_COOLDOWN", "36
 BREAKER_QUOTA_MIN = float(os.environ.get("BRIDGE_BREAKER_QUOTA_MIN", "600"))
 BREAKER_QUOTA_MAX = float(os.environ.get("BRIDGE_BREAKER_QUOTA_MAX", "691200"))  # 8d
 RETRY_AFTER_MAX = float(os.environ.get("BRIDGE_RETRY_AFTER_MAX", "60"))
+# ------------------------------------------------- subscription account (OAuth)
+# The ChatGPT-subscription fallback route reads ~/.codex/auth.json on every
+# attempt. That file is shared with the Codex app, which refreshes the same
+# rotating refresh token - so we refresh only when the token is actually dead,
+# serialise across processes with flock, and re-read before writing (see
+# codex-proxy's warning: two refreshers invalidate each other).
+OAUTH_REFRESH_MODE = os.environ.get("BRIDGE_OAUTH_REFRESH", "reactive").lower()
+OAUTH_ISSUER = os.environ.get("BRIDGE_OAUTH_ISSUER", "https://auth.openai.com")
+OAUTH_CLIENT_ID = os.environ.get("BRIDGE_OAUTH_CLIENT_ID",
+                                 "app_EMoamEEZ73f0CkXaXp7hrann")
+OAUTH_SKEW = float(os.environ.get("BRIDGE_OAUTH_SKEW", "300"))
+OAUTH_TIMEOUT = float(os.environ.get("BRIDGE_OAUTH_TIMEOUT", "30"))
+# accounts are discovered from these dirs (colon separated): dir/auth.json plus
+# one level of subdirectories that have their own auth.json
+OAUTH_DIRS = os.environ.get("BRIDGE_OAUTH_DIRS", "~/.codex")
 # ---------------------------------------------------------- streaming health
 # A relay that opens a stream and then emits only bookkeeping events (or nothing
 # at all) must not be committed to - the client would simply hang. We buffer
@@ -642,8 +826,13 @@ def breaker_state(pid, now=None):
 
 
 def breaker_ok(pid):
+    """One success closes the breaker - except a quota park: a spent account
+    still answers 200 while its window is exhausted, so only fresh quota data
+    (below 100%) may lift that hold."""
     with _stats_lock:
         b = _bucket(pid)
+        if b.get("last_error") == "quota" and (b.get("open_until") or 0) > time.time():
+            return
         b["fails"] = 0
         b["cooldown"] = BREAKER_COOLDOWN
         b["open_until"] = 0
@@ -960,14 +1149,16 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 ordered.remove(pid)
                 ordered.insert(0, pid)
                 log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
+    ordered = ordered + oauth
     if ORDER_MODE != "fixed":
+        # a parked relay (breaker open) is tried last - including parked
+        # subscription accounts in the pool
         now = time.time()
         with _stats_lock:
             broken = [p for p in ordered
                       if (_stats.get(p) or {}).get("open_until", 0) > now]
         if broken and len(broken) < len(ordered):
             ordered = [p for p in ordered if p not in broken] + broken
-    ordered = ordered + oauth
     if remember:
         _last_plan["order"] = ordered
     return ordered, scores
@@ -1034,6 +1225,18 @@ def status_snapshot(routes, base_order, model):
             "consecutive_fails": b.get("fails", 0),
             "last_error": b.get("last_error", ""),
         })
+        if route.get("auth_type") == "oauth":
+            quota = b.get("quota") or {}
+            creds = load_oauth(route.get("auth_file") or "")
+            rows[-1]["quota"] = ({
+                "used_percent": round(quota.get("used_percent", 0), 1),
+                "plan_type": quota.get("plan_type"),
+                "credits": quota.get("credits"),
+                "reset_in_s": (int(quota["reset_after_s"])
+                               if quota.get("reset_after_s") else None),
+                "observed_age_s": int(now - quota.get("ts", now)) if quota else None,
+            } if quota else None)
+            rows[-1]["token_expires_in_s"] = (int(creds[2] - now) if creds and creds[2] else None)
     return {"mode": ORDER_MODE, "respect_start": RESPECT_START,
             "model": model, "order": ordered, "routes": rows,
             "price_days": PRICE_DAYS,
@@ -1392,9 +1595,20 @@ class Handler(BaseHTTPRequestHandler):
                         "失败率", "模型", "备注")]
             for row in snap["routes"]:
                 if row["auth_type"] == "oauth":
+                    q = row.get("quota")
+                    note = "oauth 账号，固定队尾"
+                    if q:
+                        note += "，已用 %.0f%%%s" % (q["used_percent"], (
+                            "，%s后重置" % _ago(q["reset_in_s"]) if q.get("reset_in_s") else ""))
+                        if q.get("plan_type"):
+                            note += "（%s）" % q["plan_type"]
+                    elif row.get("token_expires_in_s") is not None:
+                        note += "，token %s后过期" % _ago(max(0, row["token_expires_in_s"]))
+                    if row.get("breaker") == "open":
+                        note += " · 熔断 %ds" % row.get("breaker_open_s", 0)
                     lines.append("%-22s %7s %10s %6s %9s %5s %6s %5s  %s"
                                  % (row["name"][:22], "-", "-", "-", "-", "-", "-",
-                                    "-", "oauth 账号，固定队尾"))
+                                    "-", note))
                     continue
                 age = row["price_age_s"]
                 if row.get("breaker") == "open":
@@ -1472,6 +1686,7 @@ class Handler(BaseHTTPRequestHandler):
         last = {"status": None, "headers": [("Content-Type", "application/json")], "body": b""}
 
         counts = {}          # attempts spent per route (honours max_attempts)
+        oauth_retried = set()   # accounts already force-refreshed for this request
         done = 0
         skipped = 0
         cursor = 0
@@ -1486,18 +1701,28 @@ class Handler(BaseHTTPRequestHandler):
                 skipped += 1                       # route budget spent
                 continue
 
+            oauth_fp = None
             headers = dict(base_headers)
             if route.get("auth_type") == "oauth":
-                cred = load_oauth(route.get("auth_file") or "")
+                auth_file = route.get("auth_file") or ""
+                cred = load_oauth(auth_file)
                 if not cred:
                     skipped += 1
                     log("SKIP  %s (no oauth credentials in %s)"
-                        % (route["name"], route.get("auth_file") or "?"))
+                        % (route["name"], auth_file or "?"))
                     continue
-                token, account_id, exp = cred
+                token, account_id, exp, oauth_fp = cred
+                # proactive refresh only when the token is really dead; in "on"
+                # mode also refresh inside the skew window
+                stale_after = time.time() + (OAUTH_SKEW if OAUTH_REFRESH_MODE == "on" else 0)
+                if exp and exp <= stale_after and OAUTH_REFRESH_MODE != "off":
+                    fresh = oauth_refresh(auth_file, oauth_fp, reason="expired token")
+                    if fresh:
+                        token, account_id, exp, oauth_fp = fresh
                 if exp and exp <= time.time():
                     skipped += 1
-                    log("SKIP  %s (access token expired)" % route["name"])
+                    log("SKIP  %s (access token expired and refresh did not help)"
+                        % route["name"])
                     continue
                 headers["Authorization"] = "Bearer " + token
                 if account_id:
@@ -1526,6 +1751,9 @@ class Handler(BaseHTTPRequestHandler):
                 status = resp.status
                 raw_headers = resp.getheaders()
                 ctype = (resp.getheader("Content-Type") or "").lower()
+                if route.get("auth_type") == "oauth":
+                    # quota comes free with every answer, streaming or not
+                    note_quota(pid, raw_headers)
 
                 if status == 200 and "event-stream" in ctype:
                     # Do not commit to this relay until it actually produces a
@@ -1573,6 +1801,20 @@ class Handler(BaseHTTPRequestHandler):
                                     mount_id=start_pid, relay_id=pid)
                         conn.close()
                         return
+
+                if (status == 401 and route.get("auth_type") == "oauth"
+                        and OAUTH_REFRESH_MODE != "off" and pid not in oauth_retried):
+                    oauth_retried.add(pid)
+                    fresh = oauth_refresh(route.get("auth_file") or "", oauth_fp,
+                                          reason="401 from the account backend")
+                    if fresh:
+                        log("OAUTH 401 via %s -> refreshed, retrying the same account"
+                            % route["name"])
+                        conn.close()
+                        conn = None
+                        done = max(0, done - 1)      # a token refresh is not an attempt
+                        cursor -= 1                  # re-pick the same relay
+                        continue
 
                 body = read_all(resp)
                 conn.close()

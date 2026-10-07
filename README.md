@@ -240,6 +240,33 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
 > 顺带修掉一个真 bug：桥原来用 `HTTPResponse.read(n)` 转发流，它会**阻塞到攒满 n 字节**，
 > 等于把 SSE 按 8KB 批量转发；改成 `read1(n)` 后每个上游 chunk 立即转发。
 
+### 订阅账号：OAuth 刷新与账号池
+
+兜底路由（`auth_type: "oauth"`）用你自己的 ChatGPT 登录态。以前只是**每次尝试重读**
+`~/.codex/auth.json` —— token 一过期就只能干等。现在补齐了
+[codex-proxy](https://github.com/thezillo/codex-proxy) 那套，并加了一道它没有的跨进程保护：
+
+* **刷新时机**（`BRIDGE_OAUTH_REFRESH`）：
+  * `reactive`（默认）：**只在 token 真的过期**、或账号后端回 `401` 时才刷新；
+  * `on`：到期前 `BRIDGE_OAUTH_SKEW`（默认 300s）就刷新 —— 适合桥独占这个 `CODEX_HOME`；
+  * `off`：从不刷新（回到旧行为）。
+* **401 → 强制刷新 → 同账号重试一次**，这次重试不占尝试预算，客户端看不到失败。
+* **轮换后的 token 读-改-写回文件**：只动 `tokens` 与 `last_refresh`，
+  `OPENAI_API_KEY` 和我们不认识的字段原样保留；`tmp + fsync + rename` 原子写，权限 0600。
+* **不跟 Codex app 抢**：刷新前先拿 `<auth.json>.bridge-lock` 的跨进程 `flock`，再**重读文件**；
+  如果 app 已经换过 token，就直接用它的、不再二次轮换 —— 两个刷新者会把彼此的 refresh token 作废
+  （codex-proxy 的 README 专门警告过这一点）。
+* **账号池**：`BRIDGE_OAUTH_DIRS`（默认 `~/.codex`）下的 `auth.json` —— 目录本身 **加一层子目录** ——
+  每个都成为一条独立兜底路由，`setup.py` 自动发现并生成；某个账号额度用完会被 park，其他账号顶上。
+* **配额直接读响应头**（零额外请求）：`x-codex-{primary,secondary}-used-percent`、
+  `-window-minutes`、`-reset-at` / `-reset-after-seconds`，外加 `x-codex-plan-type` 与
+  `x-codex-credits-balance`。任一窗口 ≥ 100% 就把该账号 park 到重置时间（**只延长不缩短**），
+  后续响应若又报告 < 100% 则自动解除。`/__bridge/status` 会显示已用百分比、套餐、重置倒计时、token 余期。
+
+> **共存提示**：桥和 Codex app 共用同一个 `auth.json`。默认的 `reactive` 只在 token 已经死了才动手，
+> 风险最低；若希望桥主动刷新，建议给桥一个独立的 `CODEX_HOME`
+> （`BRIDGE_OAUTH_DIRS=/path/to/bridge-codex`，在那里单独 `codex login` 一次）。
+
 ### 安装
 
 ```bash
@@ -313,6 +340,12 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXPLORE_PRICE_FACTOR` | `2.0` | 探索只挑「最便宜的几倍」以内的中转（`0` = 不限价格）|
 | `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
 | `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
+| `BRIDGE_OAUTH_REFRESH` | `reactive` | `reactive`＝token 死了/401 才刷新；`on`＝到期前也刷新；`off`＝从不 |
+| `BRIDGE_OAUTH_DIRS` | `~/.codex` | 账号池搜索目录（`:` 分隔；目录本身 + 一层子目录里的 `auth.json`）|
+| `BRIDGE_OAUTH_SKEW` | `300` | `on` 模式下提前多少秒刷新 |
+| `BRIDGE_OAUTH_ISSUER` | `https://auth.openai.com` | 刷新端点 |
+| `BRIDGE_OAUTH_CLIENT_ID` | Codex CLI 的公开 client id | 刷新用的 OAuth client |
+| `BRIDGE_OAUTH_TIMEOUT` | `30` | 刷新请求超时 |
 | `BRIDGE_BREAKER_THRESHOLD` | `5` | 连续失败多少次开路 |
 | `BRIDGE_BREAKER_COOLDOWN` | `60` | 基础冷却秒数（失败探针翻倍）|
 | `BRIDGE_BREAKER_COOLDOWN_MAX` | `900` | 冷却上限 |
