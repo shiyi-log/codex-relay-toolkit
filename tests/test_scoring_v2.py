@@ -606,6 +606,225 @@ class SlowFailureIntegrationTest(unittest.TestCase):
                 srv.server_close()
 
 
+class CapabilityRoutingTest(unittest.TestCase):
+    """Image calls must reach a relay that can answer them, instead of walking a
+    dozen text relays (and now giving up before reaching the image ones)."""
+
+    def setUp(self):
+        bridge_mod._stats.clear()
+        bridge_mod._prices.clear()
+        bridge_mod._last_plan["order"] = []
+        bridge_mod._last_plan["signature"] = ""
+        self.routes = {p: {"name": p, "upstream": "http://" + p} for p in "abc"}
+        for pid in "abc":
+            bridge_mod._prices[pid] = {"ts": time.time(), "per_model": {},
+                                       "overall": 0.05, "trend": 1.0, "error": ""}
+
+    def test_request_scope(self):
+        self.assertEqual(bridge_mod.request_scope("/p/x/images/generations"), "images")
+        self.assertEqual(bridge_mod.request_scope("/p/x/images/edits"), "images")
+        self.assertEqual(bridge_mod.request_scope("/p/x/responses"), "text")
+
+    def test_capability_is_learned_from_success_and_refusal(self):
+        bridge_mod.note_capability("a", "images", True)
+        bridge_mod.note_capability("b", "images", False)
+        self.assertEqual(bridge_mod.capability("a", "images"), "yes")
+        self.assertEqual(bridge_mod.capability("b", "images"), "no")
+        self.assertEqual(bridge_mod.capability("c", "images"), "unknown")
+        self.assertEqual(bridge_mod.capability("b", "text"), "unknown")   # per scope
+
+    def test_a_success_outweighs_an_earlier_refusal(self):
+        bridge_mod.note_capability("a", "images", False)
+        bridge_mod.note_capability("a", "images", True)
+        self.assertEqual(bridge_mod.capability("a", "images"), "yes")
+
+    def test_the_image_relay_is_tried_before_text_relays(self):
+        bridge_mod.note_capability("c", "images", True)      # c can do images
+        bridge_mod.note_capability("a", "images", False)     # a cannot
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], None,
+                                         "gpt-image-2", scope="images")
+        self.assertEqual(order[0], "c")
+        self.assertEqual(order[-1], "a")                     # known-incapable last
+
+    def test_a_model_listed_by_a_relay_counts_as_capable(self):
+        """The first image request must not need a failed attempt to learn."""
+        bridge_mod._models_cache["c"] = {"ids": {"gpt-image-2"}, "ts": time.time()}
+        try:
+            order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], None,
+                                             "gpt-image-2", scope="images")
+        finally:
+            bridge_mod._models_cache.pop("c", None)
+        self.assertEqual(order[0], "c")
+
+    def test_a_relay_without_the_model_in_its_list_is_not_promoted(self):
+        bridge_mod._models_cache["a"] = {"ids": {"gpt-6.1-sol"}, "ts": time.time()}
+        bridge_mod.note_capability("b", "images", True)
+        try:
+            order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], None,
+                                             "gpt-image-2", scope="images")
+        finally:
+            bridge_mod._models_cache.pop("a", None)
+        self.assertEqual(order[0], "b")          # the known-capable one still wins
+
+    def test_capability_beats_a_bad_score(self):
+        """Image relays score terribly on text-tuned price/latency, so a
+        capability decision must survive the score sort."""
+        bridge_mod._prices["c"] = {"ts": time.time(), "per_model": {},
+                                   "overall": 99.0, "trend": 1.0, "error": ""}
+        bridge_mod._prices["a"] = {"ts": time.time(), "per_model": {},
+                                   "overall": 0.01, "trend": 1.0, "error": ""}
+        bridge_mod.note_capability("c", "images", True)
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], None,
+                                         "gpt-image-2", scope="images")
+        self.assertEqual(order[0], "c")     # capable but 9900x the price
+
+    def test_the_selected_image_provider_is_tried_first(self):
+        """If you picked 哈吉米 生图 in CC Switch, the request comes in on its
+        mount; it must be the first attempt even without learned capability."""
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], "c",
+                                         "gpt-image-2", scope="images")
+        self.assertEqual(order[0], "c")
+
+    def test_a_known_incapable_mount_is_not_forced_first(self):
+        bridge_mod.note_capability("c", "images", False)
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], "c",
+                                         "gpt-image-2", scope="images")
+        self.assertNotEqual(order[0], "c")
+
+    def test_a_configured_image_preference_wins(self):
+        """`{"prefer_images": ["pp 生图"]}` in bridge-prefs.json beats both the
+        score order and whichever mount the request arrived on."""
+        old = dict(bridge_mod._prefs)
+        bridge_mod._prefs["prefer_images"] = ["c"]
+        try:
+            order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], "a",
+                                             "gpt-image-2", scope="images")
+        finally:
+            bridge_mod._prefs.clear()
+            bridge_mod._prefs.update(old)
+        self.assertEqual(order[0], "c")
+
+    def test_a_preferred_relay_known_incapable_is_ignored(self):
+        old = dict(bridge_mod._prefs)
+        bridge_mod._prefs["prefer_images"] = ["c"]
+        bridge_mod.note_capability("c", "images", False)
+        try:
+            order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], "a",
+                                             "gpt-image-2", scope="images")
+        finally:
+            bridge_mod._prefs.clear()
+            bridge_mod._prefs.update(old)
+        self.assertNotEqual(order[0], "c")
+
+    def test_image_requests_get_a_longer_budget(self):
+        self.assertGreater(bridge_mod.IMAGE_TIMEOUT, bridge_mod.FIRST_BYTE_TIMEOUT)
+        self.assertGreaterEqual(bridge_mod.IMAGE_TIMEOUT, 180)
+
+    def test_text_order_is_unchanged(self):
+        bridge_mod.note_capability("a", "images", False)
+        order, _ = bridge_mod.plan_order(self.routes, ["a", "b", "c"], None,
+                                         "gpt-6.1-sol", scope="text")
+        self.assertEqual(set(order), set("abc"))             # no image knowledge applied
+
+
+class UnsupportedGiveUpTest(unittest.TestCase):
+    """When every relay answers "I cannot do this kind of call", stop walking the
+    whole rotation: image calls used to run to attempt 30+ with a 20-33s hang
+    each, and one client waited 305.7s for a request that could never succeed.
+    """
+
+    def test_pool_wide_capability_failure_gives_up_early(self):
+        port = free_port()
+        relays = {}
+        for name in ("r1", "r2", "r3", "r4"):
+            srv, url = self._relay()
+            relays[name] = {"server": srv, "url": url}
+
+        tmp = tempfile.mkdtemp(prefix="unsup-")
+        routes_path = os.path.join(tmp, "routes.json")
+        with open(routes_path, "w") as fh:
+            json.dump({"port": port, "attempts": 40, "order": list(relays),
+                       "routes": {name: {"mount": "/p/" + name, "prefix": "",
+                                         "name": name,
+                                         "upstream": relays[name]["url"],
+                                         "auth": "sk"} for name in relays}}, fh)
+        env = dict(os.environ, BRIDGE_ROUTES=routes_path, BRIDGE_PORT=str(port),
+                   BRIDGE_STATE=os.path.join(tmp, "state.json"),
+                   BRIDGE_LOG=os.path.join(tmp, "bridge.log"),
+                   BRIDGE_REQUEST_LOG=os.path.join(tmp, "requests.jsonl"),
+                   BRIDGE_VERBOSE="0", BRIDGE_ORDER_MODE="fixed",
+                   BRIDGE_UNSUPPORTED_GIVE_UP="3", BRIDGE_BACKOFF="0.01",
+                   BRIDGE_FIRST_BYTE_TIMEOUT="5")
+        proc = subprocess.Popen([sys.executable, BRIDGE], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        servers = [relays[n]["server"] for n in relays]
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    urllib.request.urlopen(
+                        "http://127.0.0.1:%d/__bridge/status" % port, timeout=1).read()
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            body = json.dumps({"model": "gpt-image-2", "input": "a cat"}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/p/r1/images/generations" % port, data=body,
+                headers={"Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=20)
+            self.assertEqual(caught.exception.code, 400)
+            payload = json.loads(caught.exception.read())
+            self.assertEqual(payload["error"]["type"], "unsupported_request")
+            log = open(os.path.join(tmp, "bridge.log"), errors="replace").read()
+            self.assertIn("UNSUPPORTED give-up", log)
+            # it must stop after the give-up threshold, not walk all four relays
+            per_relay = [l for l in log.splitlines()
+                         if "UNSUPPORTED " in l and "give-up" not in l]
+            self.assertLessEqual(len(per_relay), bridge_mod.UNSUPPORTED_GIVE_UP)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            for srv in servers:
+                srv.shutdown()
+                srv.server_close()
+
+    @staticmethod
+    def _relay():
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                body = json.dumps({"data": [{"id": "gpt-image-2"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                payload = json.dumps({"error": {
+                    "message": "Image generation is not enabled for this group",
+                    "type": "permission_error"}}).encode()
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+
 class LegacyStateTest(unittest.TestCase):
     """A stats bucket restored from an older bridge-state.json lacks fields added
     later. On 2026-10-07 that turned into KeyError('lat_by_model') inside the

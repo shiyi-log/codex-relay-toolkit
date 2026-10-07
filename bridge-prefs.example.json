@@ -1,0 +1,5 @@
+{
+  "_comment": "按 scope 指定优先使用的中转（名字或 id）。放到桥的运行目录并命名为 bridge-prefs.json，然后 kill -HUP 桥进程生效。",
+  "prefer_images": ["pp 生图"],
+  "prefer_text": []
+}

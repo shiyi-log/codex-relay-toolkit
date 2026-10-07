@@ -82,6 +82,10 @@ NET_BACKOFF_MAX = float(os.environ.get("BRIDGE_NET_BACKOFF_MAX", "8"))
 NET_FAIL_LIMIT = int(os.environ.get("BRIDGE_NET_FAIL_LIMIT", "15"))
 READ_TIMEOUT = float(os.environ.get("BRIDGE_TIMEOUT", "300"))
 CONNECT_TIMEOUT = float(os.environ.get("BRIDGE_CONNECT_TIMEOUT", "20"))
+# Image generation legitimately takes 20-120s before anything comes back; the
+# text-tuned socket timeout killed every image call ("read operation timed out")
+# even when the relay was fine.
+IMAGE_TIMEOUT = float(os.environ.get("BRIDGE_IMAGE_TIMEOUT", "300"))
 # How long to wait for the *first* byte of a stream. Kept below CC Switch's
 # streaming_first_byte_timeout (60s) so the bridge notices a stalled relay and
 # rotates before CC Switch gives up and truncates the client's stream.
@@ -308,6 +312,7 @@ def load_routes(force=False):
         _state["mounts"] = {r["mount"]: pid for pid, r in routes.items()}
         _state["attempts"] = int(data.get("attempts") or DEFAULT_ATTEMPTS)
         _state_mtime = mtime
+        load_prefs()
         seeded = 0
         for pid, route in routes.items():
             price = route.get("price_per_m")
@@ -695,7 +700,15 @@ if _exp:
     except Exception:
         QUOTA_EXPIRES = 0.0
 QUOTA_TIMEOUT = float(os.environ.get("BRIDGE_QUOTA_TIMEOUT", "20"))
+# Optional per-scope relay preference, e.g. {"prefer_images": ["pp 生图"]} in
+# bridge-prefs.json next to the state file. Read once at load_routes time.
+PREFS_FILE = os.environ.get("BRIDGE_PREFS", os.path.join(BASE_DIR, "bridge-prefs.json"))
 UNSUPPORTED_COOLDOWN = float(os.environ.get("BRIDGE_UNSUPPORTED_COOLDOWN", "300"))
+# If this many relays say "I cannot do this kind of call", the pool as a whole
+# cannot: stop walking the whole rotation. Image calls (/images/generations) used
+# to run to attempt 30+, hanging 20-33s per attempt and making one client wait
+# 305.7s for a request that could never succeed.
+UNSUPPORTED_GIVE_UP = int(os.environ.get("BRIDGE_UNSUPPORTED_GIVE_UP", "3"))
 # the prolite plan's window; used when only header data (which lacks the window
 # length) is available, so pacing still works from either source
 QUOTA_WINDOW_DEFAULT = float(os.environ.get("BRIDGE_QUOTA_WINDOW", str(604800)))
@@ -831,6 +844,7 @@ BUCKET_DEFAULTS = {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
                    "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {},
                    "lat_ring": [], "lat_by_model": {},
                    "slow": 0.0, "slow_ttfb": 0, "fast_ttfb": 0, "slow_last": 0.0,
+                   "caps": {},
                    "slow_streak": 0, "slow_streak_ts": 0.0,
                    "fails": 0, "open_until": 0.0, "cooldown": BREAKER_COOLDOWN,
                    "last_error": ""}
@@ -1078,6 +1092,82 @@ def breaker_open(pid, now=None):
     now = now or time.time()
     with _stats_lock:
         return (_stats.get(pid) or {}).get("open_until", 0) > now
+
+
+def note_capability(pid, scope, ok):
+    """Remember whether this relay can serve this *kind* of request.
+
+    Text relays answer image calls with 403 "not enabled for this group", and
+    image relays cannot do text. Without this the pool walks a dozen relays that
+    can never answer (image calls used to run to attempt 30+), and the relays
+    that could answer sat at the end of the rotation.
+    """
+    if not scope:
+        return
+    with _stats_lock:
+        b = _bucket(pid)
+        caps = b.setdefault("caps", {})
+        ent = caps.setdefault(scope, {"ok": 0, "bad": 0})
+        ent["ok" if ok else "bad"] += 1
+
+
+def capability(pid, scope):
+    """-> "yes" | "no" | "unknown" for this relay and request kind."""
+    if not scope:
+        return "unknown"
+    ent = ((_stats.get(pid) or {}).get("caps") or {}).get(scope)
+    if not ent:
+        return "unknown"
+    if ent.get("ok"):
+        return "yes"
+    return "no" if ent.get("bad") else "unknown"
+
+
+_prefs = {"prefer_images": [], "prefer_text": []}
+
+
+def load_prefs():
+    """Optional per-scope relay preference (by name or id).
+
+    `{"prefer_images": ["pp 生图"]}` makes that relay the first image attempt,
+    regardless of which mount the request arrived on.
+    """
+    data = {}
+    try:
+        with open(PREFS_FILE) as fh:
+            data = json.load(fh) or {}
+    except Exception:
+        data = {}
+    with _stats_lock:
+        for key in ("prefer_images", "prefer_text"):
+            value = data.get(key) or []
+            if isinstance(value, str):
+                value = [value]
+            _prefs[key] = [str(v) for v in value if v]
+    return _prefs
+
+
+def preferred_pids(scope, routes):
+    wanted = _prefs.get("prefer_images" if scope == "images" else "prefer_text") or []
+    out = []
+    for token in wanted:
+        for pid, route in routes.items():
+            if token in (pid, route.get("name")):
+                if pid not in out:
+                    out.append(pid)
+    return out
+
+
+def cached_models(pid):
+    """Model ids we already know for a relay - never fetches (plan_order must
+    not do I/O)."""
+    with _models_lock:
+        ent = _models_cache.get(pid)
+    return ent["ids"] if ent else set()
+
+
+def request_scope(path):
+    return "images" if "/images/" in (path or "") else "text"
 
 
 def record_slow_event(pid, seconds=None):
@@ -1546,7 +1636,7 @@ def pick_warmup(pids, scores):
 
 
 def plan_order(routes, base_order, start_pid, model, remember=True, explore=False,
-               affinity_pid=None):
+               affinity_pid=None, scope=None):
     """The attempt order for one request.
 
     adaptive (default): cheapest + fastest first, subscription account last,
@@ -1556,6 +1646,15 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
     speed both drift; used once every BRIDGE_EXPLORE_EVERY requests.
     """
     pids = [p for p in base_order if p in routes]
+    # Capability per relay for this kind of request. `/v1/models` is a reliable
+    # *positive* signal (an image relay lists gpt-image-*), so even the very first
+    # image request finds a relay that can answer it.
+    kind = {}
+    for pid in pids:
+        k = capability(pid, scope)
+        if k == "unknown" and scope == "images" and model and model in cached_models(pid):
+            k = "yes"
+        kind[pid] = k
     oauth = [p for p in pids if routes[p].get("auth_type") == "oauth"]
     normal = [p for p in pids if p not in oauth]
     affinity_oauth = None
@@ -1632,6 +1731,23 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 quota_note = "behind"
                 log("QUOTA behind: %s - 这次主动用账号（%s，约每 %d 个请求 1 次）"
                     % (routes_name(acct), pace["reason"], every))
+    wants_pref = bool(scope and (preferred_pids(scope, routes)
+                                 or (scope == "images" and start_pid)))
+    if scope and len(ordered) > 1 and (wants_pref
+                                       or any(k != "unknown" for k in kind.values())):
+        # Applied *after* the score sort: a relay that can answer this kind of
+        # call must come first even when its price/latency score is terrible
+        # (image relays score badly for text-tuned price/latency, and the sort
+        # used to bury the capability ordering again).
+        pref = [p for p in ordered
+                if p in preferred_pids(scope, routes) and kind.get(p) != "no"]
+        if not pref and scope == "images" and start_pid in ordered \
+                and kind.get(start_pid) != "no":
+            pref = [start_pid]                      # you picked this provider
+        ordered = (pref
+                   + [p for p in ordered if p not in pref and kind.get(p) == "yes"]
+                   + [p for p in ordered if p not in pref and kind.get(p) == "unknown"]
+                   + [p for p in ordered if p not in pref and kind.get(p) == "no"])
     ordered = ordered + oauth
     if ORDER_MODE != "fixed":
         # a parked relay (breaker open) is tried last - including parked
@@ -1827,6 +1943,7 @@ def status_snapshot(routes, base_order, model):
             "model_penalty": s.get("model_penalty"),
             "balance": b.get("balance"),
             "fixed_price": bool(route.get("price_per_m")),
+            "cap_images": capability(pid, "images"),
             "streak": s.get("streak", 0) if s else 0,
             "streak_penalty": s.get("streak_penalty", 0.0) if s else 0.0,
             "slow_rate": s.get("slow_rate", 0.0) if s else 0.0,
@@ -1930,6 +2047,20 @@ def prune_state():
     return len(set(removed))
 
 
+def refresh_models(routes):
+    """Warm the /v1/models cache for every relay (TTL-guarded).
+
+    The model list is the only *positive* capability signal we can get before a
+    request is ever sent (an image relay lists gpt-image-*), so it has to be warm
+    for image calls to find the right relay on the first try.
+    """
+    for pid, route in routes.items():
+        try:
+            route_models(pid, route)
+        except Exception:
+            continue
+
+
 def probe_quota_accounts():
     """Refresh the subscription allowance (cheap, no quota spent)."""
     if not QUOTA_PACE:
@@ -1954,6 +2085,7 @@ def housekeeping():
                 routes = dict(_state["routes"])
             if routes:
                 refresh_prices(routes)
+                refresh_models(routes)
                 probe_quota_accounts()
                 prune_state()
             save_state()
@@ -2074,7 +2206,7 @@ def is_retryable_body(body):
     return False
 
 
-def open_upstream(method, url, headers, body):
+def open_upstream(method, url, headers, body, timeout=None):
     parts = urlsplit(url)
     scheme = parts.scheme.lower()
     host = parts.hostname
@@ -2082,8 +2214,9 @@ def open_upstream(method, url, headers, body):
     target = parts.path or "/"
     if parts.query:
         target += "?" + parts.query
-    conn = HTTPSConnection(host, port, timeout=CONNECT_TIMEOUT) if scheme == "https" \
-        else HTTPConnection(host, port, timeout=CONNECT_TIMEOUT)
+    budget = timeout or CONNECT_TIMEOUT
+    conn = HTTPSConnection(host, port, timeout=budget) if scheme == "https" \
+        else HTTPConnection(host, port, timeout=budget)
     conn.request(method, target, body=body, headers=headers)
     resp = conn.getresponse()
     try:
@@ -2321,6 +2454,11 @@ class Handler(BaseHTTPRequestHandler):
                         "连败%d·降权%.1f(衰减后)" % (row["streak"], row.get("streak_penalty", 0)))
                     if row.get("probe_in_s") is not None:
                         note_extra += "·%ds后探针" % row["probe_in_s"]
+                cap = row.get("cap_images")
+                if cap == "yes":
+                    note_extra = (note_extra + " · " if note_extra else "") + "可生图"
+                elif cap == "no":
+                    note_extra = (note_extra + " · " if note_extra else "") + "不支持生图"
                 if row.get("fixed_price"):
                     note_extra = (note_extra + " · " if note_extra else "") + "固定单价"
                 if row.get("balance") is not None:
@@ -2426,6 +2564,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             parsed_body = None
         conv_key = session_key(base_headers, request_body, parsed_body)
+        scope = request_scope(split.path)
+        attempt_timeout = IMAGE_TIMEOUT if scope == "images" else FIRST_BYTE_TIMEOUT
         _explore["n"] += 1
         explore = EXPLORE_EVERY > 0 and _explore["n"] % EXPLORE_EVERY == 0
         if ORDER_MODE != "fixed" and not _prices_ready.is_set():
@@ -2435,7 +2575,7 @@ class Handler(BaseHTTPRequestHandler):
             _prices_ready.wait(PRICE_WAIT)
         sticky = affinity_get(conv_key)
         ordered, scores = plan_order(routes, base_order, start_pid, wanted,
-                                     explore=explore, affinity_pid=sticky)
+                                     explore=explore, affinity_pid=sticky, scope=scope)
         log_plan(ordered, scores, wanted, sticky=sticky)
         if sticky and ordered and ordered[0] != sticky:
             log("AFFINITY %s: leaving %s for %s"
@@ -2448,6 +2588,7 @@ class Handler(BaseHTTPRequestHandler):
 
         counts = {}          # attempts spent per route (honours max_attempts)
         oauth_retried = set()   # accounts already force-refreshed for this request
+        unsupported_pids = set()   # relays that said "cannot do this kind of call"
         done = 0
         skipped = 0
         cursor = 0
@@ -2514,7 +2655,8 @@ class Handler(BaseHTTPRequestHandler):
             conn = None
             attempt_started = time.time()
             try:
-                conn, resp = open_upstream(method, url, headers, attempt_body)
+                conn, resp = open_upstream(method, url, headers, attempt_body,
+                                           timeout=attempt_timeout)
                 status = resp.status
                 raw_headers = resp.getheaders()
                 ctype = (resp.getheader("Content-Type") or "").lower()
@@ -2529,8 +2671,7 @@ class Handler(BaseHTTPRequestHandler):
                     # "stream disconnected before completion"; rotating to the
                     # next relay is far better than handing the client a
                     # truncated body.
-                    ok, head, had_content = await_first_content(
-                        resp, FIRST_BYTE_TIMEOUT)
+                    ok, head, had_content = await_first_content(resp, attempt_timeout)
                     if not ok:
                         log("RETRY %s %s -> no content frame via %s (attempt %d/%d)"
                             % (method, split.path, route["name"], done, attempts))
@@ -2593,6 +2734,7 @@ class Handler(BaseHTTPRequestHandler):
                                     mount_id=start_pid, relay_id=pid)
                         if complete:
                             affinity_remember(conv_key, pid)
+                            note_capability(pid, scope, True)
                         conn.close()
                         return
 
@@ -2637,6 +2779,7 @@ class Handler(BaseHTTPRequestHandler):
                                 relay_id=pid)
                     if status == 200:
                         affinity_remember(conv_key, pid)
+                        note_capability(pid, scope, True)
                     log("PASS  %s %s -> %s via %s (attempt %d) model=%s"
                         % (method, split.path, status, route["name"], done,
                            wanted or "?"))
@@ -2651,9 +2794,25 @@ class Handler(BaseHTTPRequestHandler):
                     # mismatch, not a fault: short park, no failure charge (the
                     # failure EWMA is what decides who serves next).
                     state = breaker_charge(pid, kind, retry_after, reset)
+                    unsupported_pids.add(pid)
+                    note_capability(pid, scope, False)
                     log("UNSUPPORTED %s (attempt %d/%d) model=%s - short park %.0fs"
                         % (route["name"], done, attempts, wanted or "?",
                            UNSUPPORTED_COOLDOWN))
+                    if len(unsupported_pids) >= UNSUPPORTED_GIVE_UP:
+                        log("UNSUPPORTED give-up: %d relays cannot serve %s %s "
+                            "(model=%s) - answering without walking the whole pool"
+                            % (len(unsupported_pids), method, split.path, wanted or "?"))
+                        payload = json.dumps({"error": {
+                            "message": "retry bridge: no relay in the pool supports "
+                                       "this request (%s, model=%s)" % (split.path,
+                                                                        wanted or "?"),
+                            "type": "unsupported_request"}}).encode()
+                        log_request(mount_name, route["name"], wanted, done, status,
+                                    None, "unsupported", pid=pid, mount_id=start_pid,
+                                    relay_id=pid, error_kind="unsupported")
+                        self._send(400, [("Content-Type", "application/json")], payload)
+                        return
                 else:
                     record_attempt(pid, failed=True)
                     state = "noop"

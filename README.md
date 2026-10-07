@@ -424,6 +424,33 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
   而不是假定存在。2026-10-07 就是因为 `record_attempt` 直接取 `lat_by_model` 抛 KeyError，
   被重试循环当成"该中转失败"，把所有人的失败率推到 0.6–0.8（`tests/test_scoring_v2.py` 里有回归用例）。
 
+### 生图（`/images/*`）：能力感知路由
+
+图片生成和文本完全是两个池子：文本中转对生图请求回
+`403 {"type":"permission_error"}`（"Image generation is not enabled for this group"），
+生图中转（`pp 生图` / `哈吉米 生图`）只做图。桥为此做了三件事：
+
+1. **能力感知排序**（`BRIDGE_*` 无开关，始终生效）：按 `/v1/models` 的**正向信号**
+   （生图中转会列出 `gpt-image-2`）+ 实际成功/被拒的历史，给每次请求分组排序 ——
+   `能做 > 未知 > 不能做`，**且这个分组在按分数排序之后应用**（生图中转在价格/延迟上
+   分数很糟，早先被分数重排冲掉过）。状态页里标注 `可生图` / `不支持生图`。
+2. **生图专用超时**（`BRIDGE_IMAGE_TIMEOUT`，默认 300s）：生图要 20–120s 才回，
+   用文本的 20s 连接超时会让**每一次**生图请求都以 `read operation timed out` 失败。
+3. **能力缺失不再扫全池**（`BRIDGE_UNSUPPORTED_GIVE_UP`，默认 3）：3 家中转说"我做不了"
+   就直接回一个明确的 400，而不是像以前那样一轮轮试到 attempt 30+（每次还挂 20–33s，
+   有一条客户端等了 305.7s）。
+
+**指定优先用哪家生图**：`bridge-prefs.json`（放在桥的运行目录，见
+[bridge-prefs.example.json](bridge-prefs.example.json)）
+
+```json
+{ "prefer_images": ["pp 生图"] }
+```
+
+改完 `kill -HUP <桥进程>` 即生效。它优先于分数排序，也优先于"你在 CC Switch 里选的那家"
+（没配偏好时才按挂载点优先）。实测：从「哈吉米 生图」的挂载点发图，
+**第一次尝试就是 `pp 生图`**，41.3s 返回 623KB 图片。
+
 ### 订阅额度配速：不能一次用完，也不能到期没用
 
 订阅额度是**会过期的资源**：窗口一结束，没用完的部分就作废；可一次用光，后面就没有兜底了。
@@ -624,6 +651,9 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_SIDECARS` | `<脚本目录>/sidecars.json` | sidecar 清单（setup.py 与 sidecar.py 都读它）|
 | `BRIDGE_CODEX_RELAY` | `<脚本目录>/bin/codex-relay` | codex-relay 可执行文件路径 |
 | `BRIDGE_UNSUPPORTED_COOLDOWN` | `300` | 能力缺失（403 permission_error）的短 park 时长 |
+| `BRIDGE_UNSUPPORTED_GIVE_UP` | `3` | 几家说"做不了"就直接放弃，不再扫全池 |
+| `BRIDGE_IMAGE_TIMEOUT` | `300` | 生图请求的读超时（文本用 `BRIDGE_CONNECT_TIMEOUT`）|
+| `BRIDGE_PREFS` | `<运行目录>/bridge-prefs.json` | 按 scope 指定优先中转 |
 | `BRIDGE_QUOTA_PACE` | `1` | 订阅额度配速总开关 |
 | `BRIDGE_QUOTA_TTL` | `600` | 额度探测间隔（秒）|
 | `BRIDGE_QUOTA_DEADBAND` | `5` | 领先/落后多少个百分点才算偏离配速线 |
