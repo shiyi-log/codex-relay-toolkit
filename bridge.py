@@ -695,6 +695,7 @@ if _exp:
     except Exception:
         QUOTA_EXPIRES = 0.0
 QUOTA_TIMEOUT = float(os.environ.get("BRIDGE_QUOTA_TIMEOUT", "20"))
+UNSUPPORTED_COOLDOWN = float(os.environ.get("BRIDGE_UNSUPPORTED_COOLDOWN", "300"))
 # the prolite plan's window; used when only header data (which lacks the window
 # length) is available, so pacing still works from either source
 QUOTA_WINDOW_DEFAULT = float(os.environ.get("BRIDGE_QUOTA_WINDOW", str(604800)))
@@ -959,6 +960,13 @@ def _find_reset_seconds(obj, depth=0):
     return None
 
 
+# 403/rejection wording that means "this relay cannot do this" rather than
+# "your key is dead"
+UNSUPPORTED_HINTS = [h.lower() for h in (
+    "permission_error", "not enabled", "not available", "unsupported",
+    "does not support", "no permission", "forbidden for this", "not allowed")]
+
+
 def classify_error(status, headers=None, body=None):
     """-> (kind, retry_after_seconds, reset_seconds).
 
@@ -980,6 +988,13 @@ def classify_error(status, headers=None, body=None):
     if status == 429:
         return "rate_limit", retry_after, reset
     if status in (401, 403):
+        # A 403 is not always a dead key: relays answer "Image generation is not
+        # enabled for this group" / "model not available for this group" with 403
+        # permission_error. Treating that as auth parked five relays for an hour
+        # (2026-10-07 23:43) and collapsed the pool to a single relay. Capability
+        # mismatches get a short park instead, and are not counted as failures.
+        if any(h in text for h in UNSUPPORTED_HINTS):
+            return "unsupported", retry_after, reset
         return "auth", retry_after, reset
     if status == 404:
         return "model_missing", retry_after, reset
@@ -1012,6 +1027,13 @@ def breaker_charge(pid, kind, retry_after=None, reset=None):
             b["cooldown"] = hold
             # extend-only: a nearer reset must never shorten an existing hold
             b["open_until"] = max(b.get("open_until") or 0, now + hold)
+        elif kind == "unsupported":
+            # capability mismatch: skip this relay briefly for this kind of call,
+            # but do not blame it (no fail streak, no long park)
+            b["fails"] = max(0, b["fails"] - 1)
+            b["open_until"] = max(b.get("open_until") or 0,
+                                  now + UNSUPPORTED_COOLDOWN)
+            b["cooldown"] = UNSUPPORTED_COOLDOWN
         elif kind in ("rate_limit", "timeout", "server", "transport"):
             if b["fails"] >= BREAKER_THRESHOLD:
                 cd = min(BREAKER_COOLDOWN_MAX,
@@ -1536,7 +1558,15 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
     pids = [p for p in base_order if p in routes]
     oauth = [p for p in pids if routes[p].get("auth_type") == "oauth"]
     normal = [p for p in pids if p not in oauth]
-    if affinity_pid and (affinity_pid not in normal or breaker_open(affinity_pid)):
+    affinity_oauth = None
+    if affinity_pid and affinity_pid in oauth and not breaker_open(affinity_pid):
+        # The subscription backend is stateful: a conversation that ran there
+        # carries item ids only it knows. Moving it to a relay (or the other way)
+        # makes the backend answer 400 "Invalid 'input[N].id'" - 201 of those on
+        # 2026-10-07, caused by quota pacing promoting the account mid-conversation.
+        affinity_oauth = affinity_pid
+        affinity_pid = None
+    elif affinity_pid and (affinity_pid not in normal or breaker_open(affinity_pid)):
         affinity_pid = None            # the sticky relay is gone or parked
     scores = relay_scores(normal, routes, model, affinity_pid=affinity_pid)
 
@@ -1579,7 +1609,12 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 ordered.insert(0, pid)
                 log("%s promoting %s (%s)" % (why, routes[pid].get("name"), note))
     quota_note = None
-    if oauth and QUOTA_PACE and ORDER_MODE != "fixed" and remember:
+    if affinity_oauth and not breaker_open(affinity_oauth):
+        # keep the conversation where its state lives; pacing must not hijack it
+        ordered = [affinity_oauth] + ordered
+        oauth = []
+        quota_note = "affinity-account"
+    elif oauth and QUOTA_PACE and ORDER_MODE != "fixed" and remember and not affinity_pid:
         acct = oauth[0]
         pace = quota_pace(acct)
         if pace["state"] == "ahead" and not breaker_open(acct):
@@ -2608,18 +2643,27 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(status, raw_headers, body)
                     return
 
-                record_attempt(pid, failed=True)
                 kind, retry_after, reset = classify_error(status, raw_headers, body)
                 if is_retryable_body(body):
                     kind = "upstream"
-                state = "noop"
-                if kind not in ("bad_request", "model_missing"):
+                if kind == "unsupported":
+                    # "this relay cannot do this kind of call" is a capability
+                    # mismatch, not a fault: short park, no failure charge (the
+                    # failure EWMA is what decides who serves next).
                     state = breaker_charge(pid, kind, retry_after, reset)
-                    wasted = time.time() - attempt_started
-                    if wasted >= SLOW_TTFB * SLOW_WASTE_FACTOR:
-                        record_slow_event(pid, wasted)
-                        log("SLOW-FAIL %s wasted %.1fs before %s (attempt %d/%d)"
-                            % (route["name"], wasted, kind, done, attempts))
+                    log("UNSUPPORTED %s (attempt %d/%d) model=%s - short park %.0fs"
+                        % (route["name"], done, attempts, wanted or "?",
+                           UNSUPPORTED_COOLDOWN))
+                else:
+                    record_attempt(pid, failed=True)
+                    state = "noop"
+                    if kind not in ("bad_request", "model_missing"):
+                        state = breaker_charge(pid, kind, retry_after, reset)
+                        wasted = time.time() - attempt_started
+                        if wasted >= SLOW_TTFB * SLOW_WASTE_FACTOR:
+                            record_slow_event(pid, wasted)
+                            log("SLOW-FAIL %s wasted %.1fs before %s (attempt %d/%d)"
+                                % (route["name"], wasted, kind, done, attempts))
                 if retry_after:
                     backoff_hint = min(RETRY_AFTER_MAX, retry_after)
                 else:

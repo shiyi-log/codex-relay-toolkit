@@ -157,13 +157,24 @@ class AffinityTest(unittest.TestCase):
         self.assertEqual(order[0], "a")
         self.assertFalse(scores["b"]["affinity"])
 
-    def test_affinity_never_applies_to_the_subscription_account(self):
+    def test_affinity_pins_a_conversation_to_the_subscription_account(self):
+        """The subscription backend is stateful: a conversation that ran there
+        must stay there, or it answers 400 "Invalid 'input[N].id'" (201 of those
+        on 2026-10-07, caused by quota pacing promoting the account mid-thread)."""
         routes = dict(self.routes, o={"name": "acct", "upstream": "http://o",
                                       "auth_type": "oauth"})
         self.price("a", 1.0)
         self.price("b", 2.0)
         order, _ = bridge_mod.plan_order(routes, ["a", "b", "o"], "a", MODEL,
                                          affinity_pid="o")
+        self.assertEqual(order[0], "o")            # kept where its state lives
+
+    def test_without_affinity_the_account_is_still_last(self):
+        routes = dict(self.routes, o={"name": "acct", "upstream": "http://o",
+                                      "auth_type": "oauth"})
+        self.price("a", 1.0)
+        self.price("b", 2.0)
+        order, _ = bridge_mod.plan_order(routes, ["a", "b", "o"], "a", MODEL)
         self.assertEqual(order[-1], "o")
         self.assertEqual(order[0], "a")
 

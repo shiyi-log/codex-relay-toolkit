@@ -220,6 +220,13 @@ CC Switch 总览里的「总成本 $116.43」（共享定价表）≫ 桥的实�
      `BRIDGE_SLOW_STREAK_TTL`=300s 内线性衰减）：刚让你等 15s 的中转不会马上又被选中。
   3. **一次快速响应清零连慢**；且**慢 ≠ 失败**——不记失败、不熔断。
   只会用**流式首字节**判定（非流式的总时长不是首字节）；逐请求日志里带 `slow_first_byte` 便于复盘。
+* **能力缺失 ≠ 鉴权失败**（`BRIDGE_UNSUPPORTED_COOLDOWN`，默认 300s）：中转对"这个分组不支持图片生成 /
+  这个模型不可用"这类请求回 **403 + `permission_error`**，如果按 `auth` 处理就会 park **1 小时**。
+  2026-10-07 23:43 就因为这样把 5 家按掉、池子塌成一家。现在这类归为 `unsupported`：
+  短 park（默认 5 分钟）、**不计失败**、不动失败率。
+* **订阅账号是"有状态"后端，会话粘性优先于配速**：把一轮对话在中转与官方账号之间来回搬，
+  后端会拿 `400 Invalid 'input[N].id'` 拒掉（当天 201 次，正是额度配速把会话中途推给账号造成的）。
+  所以粘性指向账号时**保持粘在哪**；配速只在**没有粘性**（新会话）时才主动用账号。
   实测基线：近 24h 6265 个请求里 **1.9%** 首字节 >15s，且集中（wdlink plus 7%、pp 特惠 2%）。
 * **"慢的失败"也算慢**（`BRIDGE_SLOW_WASTE_FACTOR`，默认 0.5）：一次失败的尝试如果先耗掉
   ≥ `BRIDGE_SLOW_TTFB × factor`（默认 7.5s）才失败，它除了记一次失败，**再记一次慢**——
@@ -616,6 +623,7 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_TAKEOVER_RESTART_COOLDOWN` | `900` | 两次自动重启 CC Switch 之间的最小间隔 |
 | `BRIDGE_SIDECARS` | `<脚本目录>/sidecars.json` | sidecar 清单（setup.py 与 sidecar.py 都读它）|
 | `BRIDGE_CODEX_RELAY` | `<脚本目录>/bin/codex-relay` | codex-relay 可执行文件路径 |
+| `BRIDGE_UNSUPPORTED_COOLDOWN` | `300` | 能力缺失（403 permission_error）的短 park 时长 |
 | `BRIDGE_QUOTA_PACE` | `1` | 订阅额度配速总开关 |
 | `BRIDGE_QUOTA_TTL` | `600` | 额度探测间隔（秒）|
 | `BRIDGE_QUOTA_DEADBAND` | `5` | 领先/落后多少个百分点才算偏离配速线 |

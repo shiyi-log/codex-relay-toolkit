@@ -157,6 +157,19 @@ class PlanIntegrationTest(unittest.TestCase):
         self.assertGreater(promoted, 0)
         self.assertLess(promoted, len(orders))            # not every request
 
+    def test_pacing_does_not_hijack_a_pinned_conversation(self):
+        """Moving a live conversation between the account and a relay makes the
+        backend reject its item ids, so pacing must leave pinned threads alone."""
+        bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
+        rows, _ = bridge_mod.plan_order(self.routes, ["relay", ACCT], None,
+                                        "gpt-6.1-sol", remember=True,
+                                        affinity_pid="relay")
+        self.assertEqual(rows[0], "relay")
+        rows, _ = bridge_mod.plan_order(self.routes, ["relay", ACCT], None,
+                                        "gpt-6.1-sol", remember=True,
+                                        affinity_pid=ACCT)
+        self.assertEqual(rows[0], ACCT)           # stays where its state lives
+
     def test_pacing_can_be_switched_off(self):
         old = bridge_mod.QUOTA_PACE
         bridge_mod.QUOTA_PACE = False
