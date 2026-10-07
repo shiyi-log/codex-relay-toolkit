@@ -628,6 +628,18 @@ OAUTH_TIMEOUT = float(os.environ.get("BRIDGE_OAUTH_TIMEOUT", "30"))
 # accounts are discovered from these dirs (colon separated): dir/auth.json plus
 # one level of subdirectories that have their own auth.json
 OAUTH_DIRS = os.environ.get("BRIDGE_OAUTH_DIRS", "~/.codex")
+# ---------------------------------------------------------- balance + affinity
+# Two things measured price/latency cannot see:
+#   * a relay whose prepaid balance is nearly gone will fail soon - park it
+#     before it burns an attempt (the /v1/usage refresh already carries it)
+#   * a conversation that hops relays loses its prompt cache (and, on stateful
+#     relays, its context) - give the relay that served the last turn a bonus
+BRIDGE_MIN_BALANCE = float(os.environ.get("BRIDGE_MIN_BALANCE", "1.0"))
+BRIDGE_BALANCE_HOLD = float(os.environ.get("BRIDGE_BALANCE_HOLD", "3600"))
+BRIDGE_UNLIMITED_BALANCE = float(os.environ.get("BRIDGE_UNLIMITED_BALANCE", "1000000"))
+AFFINITY_TTL = float(os.environ.get("BRIDGE_AFFINITY_TTL", "1800"))
+AFFINITY_BONUS = float(os.environ.get("BRIDGE_AFFINITY_BONUS", "0.75"))
+AFFINITY_MAX = int(os.environ.get("BRIDGE_AFFINITY_MAX", "2000"))
 # ---------------------------------------------------------- streaming health
 # A relay that opens a stream and then emits only bookkeeping events (or nothing
 # at all) must not be committed to - the client would simply hang. We buffer
@@ -662,6 +674,8 @@ _stats = {}       # pid -> {"lat", "ok", "fail", "samples", "ts", "lat_ts", "byh
 _prices = {}      # pid -> {"ts", "per_model", "overall", "trend", "error"}
 _last_plan = {"order": [], "signature": ""}
 _explore = {"n": 0}
+_affinity = {}     # conversation key -> (pid, last seen)   [session stickiness]
+_affinity_lock = threading.Lock()
 # set once the first price refresh has landed; requests arriving during a cold
 # start wait for it for a moment instead of ordering on the fixed list
 _prices_ready = threading.Event()
@@ -794,6 +808,9 @@ def breaker_charge(pid, kind, retry_after=None, reset=None):
         if kind == "auth":
             b["cooldown"] = BREAKER_AUTH_COOLDOWN
             b["open_until"] = now + BREAKER_AUTH_COOLDOWN
+        elif kind == "balance":
+            b["cooldown"] = BRIDGE_BALANCE_HOLD
+            b["open_until"] = now + BRIDGE_BALANCE_HOLD
         elif kind == "quota":
             hold = reset if reset else (retry_after or BREAKER_QUOTA_MIN)
             hold = min(BREAKER_QUOTA_MAX, max(BREAKER_QUOTA_MIN, float(hold)))
@@ -831,7 +848,8 @@ def breaker_ok(pid):
     (below 100%) may lift that hold."""
     with _stats_lock:
         b = _bucket(pid)
-        if b.get("last_error") == "quota" and (b.get("open_until") or 0) > time.time():
+        if (b.get("last_error") in ("quota", "balance")
+                and (b.get("open_until") or 0) > time.time()):
             return
         b["fails"] = 0
         b["cooldown"] = BREAKER_COOLDOWN
@@ -935,6 +953,50 @@ def parse_usage(data, days=None):
             "daily_days": len(daily)}
 
 
+def read_balance(data):
+    """Remaining credit as the relay reports it (None when it does not).
+
+    Relays hand out absurd values for prepaid/unlimited plans (one of ours
+    reports 1.1e10), so anything above BRIDGE_UNLIMITED_BALANCE counts as
+    "no limit" instead of a real number.
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("remaining", "balance"):
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        value = float(value)
+        if value > BRIDGE_UNLIMITED_BALANCE:
+            return None
+        return max(0.0, value)
+    return None
+
+
+def note_balance(pid, balance):
+    """Park a nearly-empty relay; lift the park once it is topped up again."""
+    if balance is None:
+        return None
+    with _stats_lock:
+        b = _bucket(pid)
+        b["balance"] = balance
+        parked = (b.get("last_error") == "balance"
+                  and (b.get("open_until") or 0) > time.time())
+    if balance < BRIDGE_MIN_BALANCE:
+        if not parked:
+            breaker_charge(pid, "balance")
+            log("BALANCE %s reports $%.2f (< $%.2f) - parked for %.0fs"
+                % (pid, balance, BRIDGE_MIN_BALANCE, BRIDGE_BALANCE_HOLD))
+    elif parked:
+        with _stats_lock:
+            b = _bucket(pid)
+            b["last_error"] = ""
+            b["open_until"] = 0
+            b["fails"] = 0
+        log("BALANCE %s is back to $%.2f - usable again" % (pid, balance))
+    return balance
+
+
 def fetch_price(route):
     """Relay-reported price per weighted million tokens. Uses the relay's own
     billing (`actual_cost`), so it is what this relay really charges - not what
@@ -958,6 +1020,7 @@ def fetch_price(route):
             continue
         parsed["ts"] = time.time()
         parsed["error"] = ""
+        parsed["balance"] = read_balance(data)
         return parsed
     return {"ts": time.time(), "per_model": {}, "overall": None, "alltime": None,
             "trend": 1.0, "days": PRICE_DAYS, "daily_days": 0, "error": err}
@@ -990,6 +1053,10 @@ def refresh_prices(routes, force=False):
     deadline = time.time() + PRICE_TIMEOUT + 10
     for th in threads:
         th.join(max(0.0, deadline - time.time()))
+    for pid, _ in todo:
+        ent = _prices.get(pid) or {}
+        if "balance" in ent:
+            note_balance(pid, ent["balance"])
     bad = [pid for pid, _ in todo if (_prices.get(pid) or {}).get("error")]
     # released even when nothing came back: the cold-start wait must cost at
     # most one request, never one wait per request
@@ -1034,8 +1101,14 @@ def model_penalty(pid, model):
     return MODEL_MISSING_PENALTY
 
 
-def relay_scores(pids, routes, model):
-    """Score every relay: lower is better. Unknown data -> mid-pack."""
+def relay_scores(pids, routes, model, affinity_pid=None):
+    """Score every relay: lower is better. Unknown data -> mid-pack.
+
+    `affinity_pid` is the relay that served the last turn of this conversation:
+    it gets a bonus, because hopping relays throws away the upstream prompt cache
+    (and, on stateful relays, the conversation context) - but a clearly better
+    relay still wins.
+    """
     prices, lats = {}, {}
     for pid in pids:
         prices[pid], _exact = price_index(pid, model)
@@ -1068,8 +1141,11 @@ def relay_scores(pids, routes, model):
         else:
             l_norm = 1.0
         pen = model_penalty(pid, model)
+        bonus = AFFINITY_BONUS if (affinity_pid and pid == affinity_pid) else 0.0
         out[pid] = {
-            "score": W_PRICE * p_norm + W_LATENCY * l_norm + W_FAIL * fail_rate + pen,
+            "affinity": bool(bonus),
+            "score": (W_PRICE * p_norm + W_LATENCY * l_norm + W_FAIL * fail_rate
+                      + pen - bonus),
             "price_per_m": price, "price_norm": p_norm,
             "latency": lat, "latency_norm": l_norm,
             "fail_rate": fail_rate, "model_penalty": pen,
@@ -1078,6 +1154,64 @@ def relay_scores(pids, routes, model):
             "error": (_prices.get(pid) or {}).get("error", ""),
         }
     return out
+
+
+def session_key(headers, body_bytes, parsed=None):
+    """A stable per-conversation key.
+
+    Codex resends the whole conversation every turn, so the explicit hints come
+    first (session-id / thread-id headers, prompt_cache_key) and the fallback is
+    a hash of the parts that do not change between turns: the instructions and
+    the first input item.
+    """
+    for name in ("session-id", "thread-id", "x-client-request-id"):
+        value = (headers or {}).get(name)
+        if value:
+            return "h:" + str(value)[:80]
+    data = parsed
+    if data is None and body_bytes:
+        try:
+            data = json.loads(body_bytes.decode("utf-8"))
+        except Exception:
+            data = None
+    if not isinstance(data, dict):
+        return None
+    cache_key = data.get("prompt_cache_key")
+    if cache_key:
+        return "c:" + str(cache_key)[:80]
+    seed = json.dumps([data.get("instructions"),
+                       (data.get("input") or [None])[0] if isinstance(data.get("input"), list)
+                       else data.get("input")], ensure_ascii=False)[:4000]
+    meaningful = seed.strip().strip("[]").replace("null", "").replace(",", "").strip()
+    if not meaningful:
+        return None
+    return "p:" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+def affinity_get(key, now=None):
+    if not key:
+        return None
+    now = now or time.time()
+    with _affinity_lock:
+        ent = _affinity.get(key)
+        if not ent:
+            return None
+        pid, seen = ent
+        if now - seen > AFFINITY_TTL:
+            _affinity.pop(key, None)
+            return None
+        return pid
+
+
+def affinity_remember(key, pid, now=None):
+    if not key or not pid:
+        return
+    now = now or time.time()
+    with _affinity_lock:
+        _affinity[key] = (pid, now)
+        if len(_affinity) > AFFINITY_MAX:
+            for stale, _ in sorted(_affinity.items(), key=lambda kv: kv[1][1])[:len(_affinity) - AFFINITY_MAX]:
+                _affinity.pop(stale, None)
 
 
 def pick_explore(pids, scores):
@@ -1108,7 +1242,8 @@ def pick_warmup(pids, scores):
     return min(cands, key=lambda pid: scores[pid]["score"]) if cands else None
 
 
-def plan_order(routes, base_order, start_pid, model, remember=True, explore=False):
+def plan_order(routes, base_order, start_pid, model, remember=True, explore=False,
+               affinity_pid=None):
     """The attempt order for one request.
 
     adaptive (default): cheapest + fastest first, subscription account last,
@@ -1120,7 +1255,9 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
     pids = [p for p in base_order if p in routes]
     oauth = [p for p in pids if routes[p].get("auth_type") == "oauth"]
     normal = [p for p in pids if p not in oauth]
-    scores = relay_scores(normal, routes, model)
+    if affinity_pid and (affinity_pid not in normal or breaker_open(affinity_pid)):
+        affinity_pid = None            # the sticky relay is gone or parked
+    scores = relay_scores(normal, routes, model, affinity_pid=affinity_pid)
 
     if ORDER_MODE == "fixed":
         if start_pid in normal:
@@ -1137,8 +1274,10 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 ordered.insert(0, start_pid)
         else:
             ordered = sorted(seed, key=lambda p: scores[p]["score"])
-        if len(ordered) > 1:
-            # measuring a relay we never tried beats re-measuring an old one
+        if len(ordered) > 1 and not affinity_pid:
+            # A conversation that already has its relay keeps it: warm-up and
+            # exploration are for traffic that is not mid-conversation (Codex
+            # sessions are long, and hijacking one costs its prompt cache).
             pid, why = pick_warmup(ordered, scores), "WARMUP"
             if pid is None and explore:
                 pid, why = pick_explore(ordered, scores), "EXPLORE"
@@ -1174,7 +1313,7 @@ def _ago(seconds):
     return "%.1fh" % (seconds / 3600.0)
 
 
-def log_plan(ordered, scores, model):
+def log_plan(ordered, scores, model, sticky=None):
     """Log the ranking once per change, not once per request."""
     sig = "|".join(ordered) + "#" + (model or "")
     if sig == _last_plan["signature"]:
@@ -1196,6 +1335,15 @@ def log_plan(ordered, scores, model):
 def status_snapshot(routes, base_order, model):
     ordered, scores = plan_order(routes, base_order, None, model, remember=False)
     now = time.time()
+    # the ranking is conversation-agnostic, so report which relays are currently
+    # pinned by live conversations instead of faking a per-conversation score
+    with _affinity_lock:
+        sticky = {}
+        for key, (pid, seen) in list(_affinity.items()):
+            if now - seen > AFFINITY_TTL:
+                _affinity.pop(key, None)
+                continue
+            sticky[pid] = sticky.get(pid, 0) + 1
     rows = []
     for pid in ordered:
         route = routes[pid]
@@ -1220,6 +1368,9 @@ def status_snapshot(routes, base_order, model):
                 str(time.localtime(now).tm_hour), {}).get("samples", 0),
             "fail_rate": round(s["fail_rate"], 3) if s else None,
             "model_penalty": s.get("model_penalty"),
+            "balance": b.get("balance"),
+            "affinity": sticky.get(pid, 0) > 0,
+            "affinity_sessions": sticky.get(pid, 0),
             "breaker": breaker_state(pid),
             "breaker_open_s": max(0, int((b.get("open_until") or 0) - now)),
             "consecutive_fails": b.get("fails", 0),
@@ -1617,6 +1768,12 @@ class Handler(BaseHTTPRequestHandler):
                         row_note += " · " + row["price_note"]
                 else:
                     row_note = row["price_note"] or ""
+                note_extra = ""
+                if row.get("balance") is not None:
+                    note_extra = "余额 $%.2f" % row["balance"]
+                if row.get("affinity"):
+                    note_extra = ((note_extra + " · " if note_extra else "")
+                                  + "会话粘住×%d" % row.get("affinity_sessions", 1))
                 lines.append("%-22s %7s %10s %6s %9s %5s %6s %5s  %s"
                              % (row["name"][:22],
                                 row["score"] if row["score"] is not None else "-",
@@ -1626,8 +1783,10 @@ class Handler(BaseHTTPRequestHandler):
                                 row["latency_samples"] or "-",
                                 ("%.2f" % row["fail_rate"]) if row["fail_rate"] is not None else "-",
                                 ("-%.1f" % row["model_penalty"]) if row["model_penalty"] else "ok",
-                                row_note
-                                or ("价格 %s前" % _ago(age) if age is not None else "")))
+                                " · ".join(x for x in (
+                                    row_note,
+                                    note_extra,
+                                    ("价格 %s前" % _ago(age)) if (age is not None and not row_note) else "") if x)))
             body = ("\n".join(lines) + "\n").encode("utf-8")
             self._send(200, [("Content-Type", "text/plain; charset=utf-8")], body)
             return
@@ -1666,10 +1825,13 @@ class Handler(BaseHTTPRequestHandler):
             base_order = list(_state["order"])
 
         wanted = None
+        parsed_body = None
         try:
-            wanted = (json.loads(request_body.decode("utf-8")) or {}).get("model")
+            parsed_body = json.loads(request_body.decode("utf-8")) or {}
+            wanted = parsed_body.get("model")
         except Exception:
-            pass
+            parsed_body = None
+        conv_key = session_key(base_headers, request_body, parsed_body)
         _explore["n"] += 1
         explore = EXPLORE_EVERY > 0 and _explore["n"] % EXPLORE_EVERY == 0
         if ORDER_MODE != "fixed" and not _prices_ready.is_set():
@@ -1677,9 +1839,14 @@ class Handler(BaseHTTPRequestHandler):
             # first price refresh so the very first request is already ordered
             # by price, instead of falling back to the fixed list
             _prices_ready.wait(PRICE_WAIT)
+        sticky = affinity_get(conv_key)
         ordered, scores = plan_order(routes, base_order, start_pid, wanted,
-                                     explore=explore)
-        log_plan(ordered, scores, wanted)
+                                     explore=explore, affinity_pid=sticky)
+        log_plan(ordered, scores, wanted, sticky=sticky)
+        if sticky and ordered and ordered[0] != sticky:
+            log("AFFINITY %s: leaving %s for %s"
+                % ((conv_key or "?")[:24], routes[sticky]["name"],
+                   routes[ordered[0]]["name"]))
         mount_name = (routes.get(start_pid) or {}).get("name") or start_pid
 
         start_time = time.time()
@@ -1799,6 +1966,8 @@ class Handler(BaseHTTPRequestHandler):
                                     stream_complete=complete,
                                     response_id=scanner.response_id,
                                     mount_id=start_pid, relay_id=pid)
+                        if complete:
+                            affinity_remember(conv_key, pid)
                         conn.close()
                         return
 
@@ -1841,6 +2010,8 @@ class Handler(BaseHTTPRequestHandler):
                                 seconds, "pass", pid=pid, tokens=tokens,
                                 response_id=response_id, mount_id=start_pid,
                                 relay_id=pid)
+                    if status == 200:
+                        affinity_remember(conv_key, pid)
                     log("PASS  %s %s -> %s via %s (attempt %d) model=%s"
                         % (method, split.path, status, route["name"], done,
                            wanted or "?"))

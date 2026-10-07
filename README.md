@@ -96,6 +96,15 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
   **"便宜"永远不会悄悄变成"模型更差"。**
 * 完全没有数据的中转按**中位数**参与排序（探索），不会因为没数据被打入冷宫，
   也不会凭空白嫖第一位。
+* **会话粘性**：一轮对话里 Codex 每回合都会重发整段历史，桥按
+  `session-id`/`thread-id` 头 → `prompt_cache_key` → `instructions`+首个输入项的哈希
+  认出"同一个会话"，给**上一回合服务它的那家中转**加一个固定加成
+  （`BRIDGE_AFFINITY_BONUS`，默认 0.75）。加成本身不会锁死：明显更便宜/更快的中转照样能赢；
+  粘住的中转被熔断或消失时立刻放弃粘性。这样能保住上游的 **prompt cache**
+  （以及有状态中转的会话上下文），也**不会**被预热/探索打断（有粘性时这两个让路）。
+* **余额感知**：`/v1/usage` 刷新时顺带读回余额；低于 `BRIDGE_MIN_BALANCE`（默认 $1）
+  就 park 这个中转（`BRIDGE_BALANCE_HOLD`，默认 1 小时），充值后自动解除 ——
+  不用等打到没钱才失败。中转发出的天文数字（预付/无限套餐）按"无限制"处理。
 * 排序用上一次的顺序做稳定排序的种子，分数接近时不会来回抖动。
 * 官方订阅账号（`auth_type: "oauth"`）**永远排最后**，仍然单独限次。
 * `BRIDGE_ORDER_MODE=fixed` 可以退回原来的行为：从 CC Switch 选中的那家开始轮询。
@@ -123,6 +132,7 @@ wdlink  deepseek4.1        ──  查询不到用量（key 已失效）
 ```
 
 * `价格趋势`：最近几天 ÷ 历史（`x1.40` = 这家最近涨价了，排序会相应后退）。
+* 备注列还会出现 `余额 $x`、`会话粘住×N`（当前有 N 个会话钉在这家）、`熔断 120s`。
 * `样本`／`首字节` 是实测值，超过 `BRIDGE_LATENCY_MAX_AGE` 没再测到就显示 `-`（不采信）。
 
 * 去掉 `?text=1` 就是 JSON；加 `&model=gpt-6.1-sol` 看指定模型的排序。
@@ -340,6 +350,12 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_EXPLORE_PRICE_FACTOR` | `2.0` | 探索只挑「最便宜的几倍」以内的中转（`0` = 不限价格）|
 | `BRIDGE_WARMUP_PRICE_FACTOR` | `2.0` | 从没测过的中转，价格在「最便宜的几倍」以内就先测一次（`0` = 关闭）|
 | `BRIDGE_EWMA_ALPHA` | `0.3` | 延迟/失败率的新样本权重（越大跟得越快、越抖）|
+| `BRIDGE_MIN_BALANCE` | `1.0` | 余额低于这个数（美元）就 park 该中转 |
+| `BRIDGE_BALANCE_HOLD` | `3600` | 余额不足时的 park 时长 |
+| `BRIDGE_UNLIMITED_BALANCE` | `1000000` | 大于此值视为"无限制"，不参与余额判断 |
+| `BRIDGE_AFFINITY_TTL` | `1800` | 会话粘性的存活时间（秒，按最后一次使用算）|
+| `BRIDGE_AFFINITY_BONUS` | `0.75` | 粘性中转在排序里的加成（分数越低越好）|
+| `BRIDGE_AFFINITY_MAX` | `2000` | 同时记住多少个会话 |
 | `BRIDGE_OAUTH_REFRESH` | `reactive` | `reactive`＝token 死了/401 才刷新；`on`＝到期前也刷新；`off`＝从不 |
 | `BRIDGE_OAUTH_DIRS` | `~/.codex` | 账号池搜索目录（`:` 分隔；目录本身 + 一层子目录里的 `auth.json`）|
 | `BRIDGE_OAUTH_SKEW` | `300` | `on` 模式下提前多少秒刷新 |

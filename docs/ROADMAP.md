@@ -52,7 +52,10 @@ LiteLLM 的 `cost-based-routing` 用**静态价格表**、延迟用**全局平�
    `x-codex-*` 响应头配额直接进熔断与状态页。
 2. **配额感知路由**：兜底账号的 `x-codex-primary/secondary-used-percent`、`reset-at` 直接进排序；`usage_limit_reached` 时把该账号 park 到重置时间（熔断的 quota 分支已经准备好了）。
 3. **协议转换 = 组合而非重写**：Chat-Completions-only 的渠道（Kimi/Qwen/GLM 等）用 `codex-relay` 起一个 sidecar（一个 provider 一个端口），在我们这里注册成普通路由。**注意其 `previous_response_id` 会话存储在实例内**：跨实例故障转移会静默丢上下文，所以要么只在轮次边界切换，要么接受损失。
-4. **会话粘性**：把同一会话（session-id / `prompt_cache_key`）固定到同一个中转，提高 prompt cache 命中（LiteLLM 的 session affinity 思路）。
+4. ~~**会话粘性**~~ **已完成**：按 session-id / thread-id / prompt_cache_key /
+   instructions+首项哈希认出会话，给上一回合的中转加 0.75 分加成（不是硬钉死，
+   明显更优的中转照样赢；被熔断立刻放弃）；有粘性时预热与探索让路。
+   顺带做了**余额感知**：`/v1/usage` 刷新时读回余额，低于阈值就 park。
 5. **标签约束**：客户端用请求头表达 `cheap` / `!expensive`，排序在子集内进行（LiteLLM 的 tag routing，带否定）。
 
 ## 参考
