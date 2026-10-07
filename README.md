@@ -68,6 +68,36 @@ CC Switch 这一层有自己的重试、超时（默认流式首字节 180s）�
 
 ---
 
+## 统计与证据（都是真实输出）
+
+README 里的数字不该只是"我声称"。下面三张是**实际跑出来的**：
+
+**① 请求统计** —— `python3 request_stats.py`
+
+![请求统计](docs/images/evidence-stats.png)
+
+关键三行就是"又便宜又快"的量化证据：
+**① 52% 入口那家本来就是第一名；② 45% 是主动切换（前面没有任何失败）；③ 只有 3% 是失败重连**。
+下面按中转列出服务次数、主动切换次数、失败重连次数、首字节中位、加权 token 与估算花费；
+缓存命中率 94%，估算总花费 $7.21（按**各家自己的实测单价**，见 `request_stats.py` 的口径说明）。
+
+**② 归属证据** —— `relay_attrib.py --status` + 变更记录 + CC Switch 库里的分布
+
+![归属证据](docs/images/evidence-attrib.png)
+
+累计改写 2207 行：`from` 是桥的挂载点、`to` 是真正服务的中转（用响应的 `request_id` 精确匹配）。
+改写之后，CC Switch 自己的请求日志里能看到 9 家中转；其中 **`OpenAI Official 47 行`**
+正是 2026-10-07 那次"流量绕过桥"（11:04–13:28 直连官方账号）留下的记录 —— 归因让这件事也留了痕。
+
+**③ 成本口径对账** —— `python3 reconcile.py`
+
+![成本口径对账](docs/images/evidence-reconcile.png)
+
+同一窗口的三组数字：**桥的估算**（各家实测单价 × token）、**CC Switch 自己的表**
+（共享定价表）、以及**余额实际减少**（中转自己扣的钱，唯一的地面真相）。
+这就是当初发现"单价被低估约 4 倍"的方法：桥估算与余额对不上，于是去掉 `trend` 乘算、
+改用历史每模型单价，误差落回 20% 以内。`reconcile.py --sample` 已在 launchd 里每 15 分钟采一次余额。
+
 ## 一、重试桥（`bridge.py`）
 
 一个零依赖的 HTTP 代理，**自己拥有重试循环**。
@@ -656,6 +686,20 @@ wdlink 福利                200       84.61191884 USD   钱包余额         ok
   复制出来的中转会把这个字段一起复制走 —— 于是界面上显示的是**别人家的余额**。
   这一列会直接标 `错: https://…（应 https://…）`，跑一次 `setup.py` 就能对齐。
   查不到余额的中转会把自己的 HTTP 状态和错误原因打出来，不再静默变成"没有数据"。
+
+### 成本口径对账（`reconcile.py`）
+
+```bash
+python3 reconcile.py            # 窗口 = 两次余额采样之间：桥估算 / CC Switch 表 / 余额实际减少
+python3 reconcile.py --hours 6  # 指定窗口
+python3 reconcile.py --sample   # 只采一次余额（给 launchd 用，已内置每 15 分钟）
+python3 reconcile.py --json
+```
+
+余额采样存在 `balance-history.jsonl`。首次运行会用 `bridge-state.json` 里最近一次价格刷新
+顺带读回的余额做基线，所以一开始就有窗口可比。**为什么需要它**：CC Switch 的成本列用的是
+共享定价表，实测与真实扣费能差一个数量级；而中转自己的 `actual_cost` 也可能有偏差——
+唯一可信的是余额减少。
 
 ### 真实价格查询
 
