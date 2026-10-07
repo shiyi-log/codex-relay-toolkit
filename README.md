@@ -69,8 +69,10 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
 **价格和速度都是变量**，所以这里没有一次性标定，全部是「最近观测」：
 
 * **价格取最近 `BRIDGE_PRICE_DAYS`（默认 3 天）的账单**，不是历史平均值。
-  `/v1/usage` 的 `daily_usage` 给出每天的真实扣费，用它算出「最近价格 / 历史价格」的趋势系数，
-  再乘到每个模型的单价上。**昨天涨价的中转，今天不会继续显得便宜**（趋势上限 5 倍、下限 0.2 倍）。
+  `/v1/usage` 的 `daily_usage` 给出每天的真实扣费，用它算出「最近 ÷ 历史」的趋势系数并**只作展示**。
+  单价用**历史每模型实测单价**，不乘趋势 —— 2026-10-07 用真实余额对账发现：把趋势乘进单价后，
+  pp/wdlink 两个账号的成本被低估约 4 倍（最近缓存占比高 → 摊薄了「最近 $/加权token」，
+  单价其实没变），而**历史口径与余额实际扣费相差 20% 以内**。
 * **超过 `BRIDGE_PRICE_MAX_AGE`（默认 6h）没更新过的价格直接不采信**，
   当作「没有数据」处理，而不是拿旧价格继续排。
 * **速度按小时分桶**：`byhour` 里每个小时各自一条 EWMA，
@@ -105,6 +107,11 @@ Codex ──► CC Switch 代理 ──► 重试桥 ──► 中转 A
 * **余额感知**：`/v1/usage` 刷新时顺带读回余额；低于 `BRIDGE_MIN_BALANCE`（默认 $1）
   就 park 这个中转（`BRIDGE_BALANCE_HOLD`，默认 1 小时），充值后自动解除 ——
   不用等打到没钱才失败。中转发出的天文数字（预付/无限套餐）按"无限制"处理。
+* **按模型分别统计速度**：实测各家中转在不同模型上的首字节能差 1–4 秒，
+  所以延迟按 (中转, 模型) 记录（样本够才启用，否则退回小时/总体）。结果是排序**按模型分化**：
+  例如 `gpt-6.1-sol` 首选 pp 特惠，而 `gpt-6-sol` 首选哈吉米 稳定。
+* 权重可调：`BRIDGE_W_PRICE`（默认 1.0）、`BRIDGE_W_LATENCY`（默认 **1.5**，速度）、
+  `BRIDGE_W_FAIL`（默认 2.0，失败率）。分数是各维度归一化后的加权和，越小越好。
 * 排序用上一次的顺序做稳定排序的种子，分数接近时不会来回抖动。
 * 官方订阅账号（`auth_type: "oauth"`）**永远排最后**，仍然单独限次。
 * `BRIDGE_ORDER_MODE=fixed` 可以退回原来的行为：从 CC Switch 选中的那家开始轮询。
@@ -131,7 +138,9 @@ pp pro                     3.10      0.230   x1.00       ?ms     0   0.00    ok 
 wdlink  deepseek4.1        ──  查询不到用量（key 已失效）
 ```
 
-* `价格趋势`：最近几天 ÷ 历史（`x1.40` = 这家最近涨价了，排序会相应后退）。
+* `价格趋势`：最近 ÷ 历史（`x1.40` = 这家最近涨价了，**仅供参考**，不参与排序乘算）。
+* 延迟用**最近 15 次样本的中位数**（每个模型单独统计），不是均值：长尾会把均值拖高
+  （某家中位 6.4s、均值 8.0s），均值化会让所有中转看起来"一样慢"，速度权重就失效了。
 * 备注列还会出现 `余额 $x`、`会话粘住×N`（当前有 N 个会话钉在这家）、`熔断 120s`。
 * `样本`／`首字节` 是实测值，超过 `BRIDGE_LATENCY_MAX_AGE` 没再测到就显示 `-`（不采信）。
 
@@ -159,7 +168,7 @@ tail -f ~/.ccswitch-retry-bridge/bridge-requests.jsonl
 
 **`tokens` 来自中转自己返回的 `usage`**（`input` 是**未缓存**输入，即 `input_tokens`
 减去 `input_tokens_details.cached_tokens`）；**`est_cost_usd` = 该请求的加权 token ×
-`price_per_m`**，而 `price_per_m` 是**这家自己的实测单价**（见上文，最近几天账单×趋势）。
+`price_per_m`**，而 `price_per_m` 是**这家自己的实测单价**（见上文，历史每模型账单）。
 所以这个金额是"这次请求在这家中转上实际该花多少"，比 CC Switch 的混合单价更接近真相。
 流式响应里 usage 只在最后一个事件出现，桥用有界扫描（`UsageScanner`）解析，
 不缓存整个响应；截断的 usage 一律丢弃，不会记半截数字。
@@ -276,6 +285,18 @@ python3 relay_attrib.py --rollback        # 按变更记录一键还原
 > **共存提示**：桥和 Codex app 共用同一个 `auth.json`。默认的 `reactive` 只在 token 已经死了才动手，
 > 风险最低；若希望桥主动刷新，建议给桥一个独立的 `CODEX_HOME`
 > （`BRIDGE_OAUTH_DIRS=/path/to/bridge-codex`，在那里单独 `codex login` 一次）。
+
+### 零停机部署与运维端点
+
+* **SIGHUP 热重载**：`kill -HUP <bridge pid>` 会让桥**自 exec 并复用自己的监听 socket**，
+  端口一秒都不会关。这样做不只是"优雅"——桥的**重启正是 CC Switch 交还官方账号的触发条件**
+  （重启瞬间 12 个挂载点同时失败），热重载从根上消除了这个事件，而且 launchd 里的 pid 不变。
+  第一次部署（旧进程没有处理器）仍需 `launchctl kickstart -k`，之后都用 SIGHUP。
+* **`POST /__bridge/maintenance`**：`{"reset":["penalties"]}` 清掉**假的**失败信号
+  （fail EWMA 与熔断 park），但保留价格与延迟这类真实测量。桥自身的 bug 不该继续惩罚中转。
+* **状态字段兼容**：`bridge-state.json` 由旧版本保存时缺少新字段——每个字段都必须**回填**
+  而不是假定存在。2026-10-07 就是因为 `record_attempt` 直接取 `lat_by_model` 抛 KeyError，
+  被重试循环当成"该中转失败"，把所有人的失败率推到 0.6–0.8（`tests/test_scoring_v2.py` 里有回归用例）。
 
 ### 别让流量悄悄绕过桥（`takeover.py`）
 
@@ -413,7 +434,14 @@ python3 restore.py               # 把原始 base_url 还原回去
 | `BRIDGE_PRICE_TTL` | `600` | 价格（`/v1/usage`）刷新间隔秒数 |
 | `BRIDGE_PRICE_TIMEOUT` | `8` | 查询价格的单次超时 |
 | `BRIDGE_PRICE_WAIT` | `8` | 冷启动时首个请求最多等多久拿到第一轮价格（有 `bridge-state.json` 时不需要等）|
-| `BRIDGE_PRICE_DAYS` | `3` | 价格取最近几天的账单（趋势系数）|
+| `BRIDGE_PRICE_DAYS` | `3` | 趋势参考窗口（仅展示，不影响单价）|
+| `BRIDGE_W_PRICE` | `1.0` | 价格权重 |
+| `BRIDGE_W_LATENCY` | `1.5` | 速度权重 |
+| `BRIDGE_W_FAIL` | `2.0` | 失败率权重 |
+| `BRIDGE_LAT_RING` | `15` | 延迟中位数的样本窗口 |
+| `BRIDGE_LAT_RING_MIN` | `5` | 样本数不足时退回 EWMA |
+| `BRIDGE_MODEL_MIN_SAMPLES` | `5` | 按模型的延迟启用门槛 |
+| `BRIDGE_AFFINITY_BONUS` | `0.3` | 会话粘性加成（原 0.75，会压制切换）|
 | `BRIDGE_PRICE_MAX_AGE` | `21600` | 超过这么久没刷到的价格不采信（秒）|
 | `BRIDGE_LATENCY_MAX_AGE` | `1800` | 超过这么久没测过的速度不采信（秒）|
 | `BRIDGE_HOUR_MIN_SAMPLES` | `3` | 「当前小时」的延迟样本达到这么多才优先用它 |

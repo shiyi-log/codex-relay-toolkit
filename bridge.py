@@ -46,6 +46,7 @@ import json
 import os
 import random
 import re
+import signal
 import socket
 import sys
 import threading
@@ -584,7 +585,7 @@ MODELS_TTL = float(os.environ.get("BRIDGE_MODELS_TTL", "1800"))
 ORDER_MODE = os.environ.get("BRIDGE_ORDER_MODE", "adaptive").lower()
 RESPECT_START = os.environ.get("BRIDGE_RESPECT_START", "0") == "1"
 W_PRICE = float(os.environ.get("BRIDGE_W_PRICE", "1.0"))
-W_LATENCY = float(os.environ.get("BRIDGE_W_LATENCY", "1.0"))
+W_LATENCY = float(os.environ.get("BRIDGE_W_LATENCY", "1.5"))
 W_FAIL = float(os.environ.get("BRIDGE_W_FAIL", "2.0"))
 MODEL_ADAPT_PENALTY = float(os.environ.get("BRIDGE_MODEL_ADAPT_PENALTY", "0.4"))
 MODEL_MISSING_PENALTY = float(os.environ.get("BRIDGE_MODEL_MISSING_PENALTY", "1.5"))
@@ -608,6 +609,15 @@ PRICE_DAYS = int(os.environ.get("BRIDGE_PRICE_DAYS", "3"))
 PRICE_MAX_AGE = float(os.environ.get("BRIDGE_PRICE_MAX_AGE", "21600"))     # 6h
 LATENCY_MAX_AGE = float(os.environ.get("BRIDGE_LATENCY_MAX_AGE", "1800"))  # 30min
 HOUR_MIN_SAMPLES = int(os.environ.get("BRIDGE_HOUR_MIN_SAMPLES", "3"))
+# how many samples a per-model latency needs before it outranks the overall one
+MODEL_MIN_SAMPLES = int(os.environ.get("BRIDGE_MODEL_MIN_SAMPLES", "5"))
+# Latency is summarised by the median of the last N samples, not the EWMA: the
+# distribution has a heavy tail (a relay with a 6.4s median showed an 8.0s EWMA),
+# and a mean dragged up by rare stalls makes every relay look equally slow - the
+# exact reason a "speed weight" was doing nothing. The EWMA stays as the
+# fallback until the ring has enough samples.
+LAT_RING = int(os.environ.get("BRIDGE_LAT_RING", "15"))
+LAT_RING_MIN = int(os.environ.get("BRIDGE_LAT_RING_MIN", "5"))
 EXPLORE_EVERY = int(os.environ.get("BRIDGE_EXPLORE_EVERY", "50"))
 # Exploration costs a real request, so only spend it on a relay that could
 # actually win: background /v1/usage refresh already catches price changes, so
@@ -659,7 +669,7 @@ BRIDGE_MIN_BALANCE = float(os.environ.get("BRIDGE_MIN_BALANCE", "1.0"))
 BRIDGE_BALANCE_HOLD = float(os.environ.get("BRIDGE_BALANCE_HOLD", "3600"))
 BRIDGE_UNLIMITED_BALANCE = float(os.environ.get("BRIDGE_UNLIMITED_BALANCE", "1000000"))
 AFFINITY_TTL = float(os.environ.get("BRIDGE_AFFINITY_TTL", "1800"))
-AFFINITY_BONUS = float(os.environ.get("BRIDGE_AFFINITY_BONUS", "0.75"))
+AFFINITY_BONUS = float(os.environ.get("BRIDGE_AFFINITY_BONUS", "0.3"))
 AFFINITY_MAX = int(os.environ.get("BRIDGE_AFFINITY_MAX", "2000"))
 # ---------------------------------------------------------- streaming health
 # A relay that opens a stream and then emits only bookkeeping events (or nothing
@@ -702,20 +712,35 @@ _affinity_lock = threading.Lock()
 _prices_ready = threading.Event()
 
 
+BUCKET_DEFAULTS = {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
+                   "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {},
+                   "lat_ring": [], "lat_by_model": {},
+                   "fails": 0, "open_until": 0.0, "cooldown": BREAKER_COOLDOWN,
+                   "last_error": ""}
+
+
 def _bucket(pid):
-    return _stats.setdefault(
-        pid, {"lat": None, "ok": 0.0, "fail": 0.0, "samples": 0,
-              "ts": 0.0, "lat_ts": 0.0, "attempt_ts": 0.0, "byhour": {},
-              "fails": 0, "open_until": 0.0, "cooldown": BREAKER_COOLDOWN,
-              "last_error": ""})
+    """Get (or create) a relay's stats bucket, **backfilling new fields**.
+
+    A bucket restored from an older bridge-state.json has whatever fields that
+    version knew about; a field added later must not turn every request into a
+    KeyError that the retry loop then treats as a relay failure (that is exactly
+    what happened on 2026-10-07 with lat_by_model).
+    """
+    b = _stats.setdefault(pid, {})
+    for key, default in BUCKET_DEFAULTS.items():
+        if key not in b:
+            b[key] = default.copy() if isinstance(default, (dict, list)) else default
+    return b
 
 
-def record_attempt(pid, seconds=None, failed=False):
+def record_attempt(pid, seconds=None, failed=False, model=None):
     """Feed one attempt into the relay's score.
 
-    Two axes, both time-varying: EWMA overall and EWMA for the current hour of
-    the day, so peak-hour slowness is remembered for that hour instead of
-    dragging the relay down all day.
+    Three axes, all time-varying: EWMA overall, EWMA for the current hour of the
+    day (peak-hour slowness is remembered for that hour, not all day), and EWMA
+    **per model** - because the interesting speed differences between relays are
+    per model (a few seconds, and the mix of models changes the average).
     """
     with _stats_lock:
         b = _bucket(pid)
@@ -731,8 +756,29 @@ def record_attempt(pid, seconds=None, failed=False):
                     b["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
                 b["samples"] += 1
                 b["lat_ts"] = now
+                ring = b.setdefault("lat_ring", [])
+                ring.append(seconds)
+                del ring[:-LAT_RING]
+                if model:
+                    per = b["lat_by_model"]
+                    ent = per.get(model) or {"lat": None, "samples": 0, "ts": 0.0,
+                                             "ring": []}
+                    ent.setdefault("ring", []).append(seconds)
+                    del ent["ring"][:-LAT_RING]
+                    ent["lat"] = (seconds if ent["lat"] is None else
+                                  ent["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
+                    ent["samples"] += 1
+                    ent["ts"] = now
+                    per[model] = ent
+                    if len(per) > 40:                      # bound the state file
+                        stale = sorted(per.items(), key=lambda kv: kv[1].get("ts", 0))
+                        for old_model, _ in stale[:len(per) - 40]:
+                            per.pop(old_model, None)
                 hour = str(time.localtime(now).tm_hour)
-                h = b["byhour"].setdefault(hour, {"lat": None, "samples": 0})
+                h = b["byhour"].setdefault(hour, {"lat": None, "samples": 0,
+                                                  "ring": []})
+                h.setdefault("ring", []).append(seconds)
+                del h["ring"][:-LAT_RING]
                 h["lat"] = seconds if h["lat"] is None else (
                     h["lat"] * (1 - EWMA_ALPHA) + seconds * EWMA_ALPHA)
                 h["samples"] += 1
@@ -884,21 +930,41 @@ def breaker_open(pid, now=None):
         return (_stats.get(pid) or {}).get("open_until", 0) > now
 
 
-def effective_latency(pid, now=None):
-    """Latency used for scoring: this hour's figure when it has enough samples,
-    otherwise the recent overall figure.
+def lat_stat(ring, ewma):
+    """Median of the recent samples when there are enough of them, else EWMA."""
+    values = [v for v in (ring or []) if isinstance(v, (int, float)) and v > 0]
+    if len(values) >= LAT_RING_MIN:
+        values = sorted(values)
+        mid = len(values) // 2
+        return (values[mid] if len(values) % 2 else
+                (values[mid - 1] + values[mid]) / 2.0)
+    return ewma
+
+
+def effective_latency(pid, model=None, now=None):
+    """Latency used for scoring, most specific first:
+
+    1. this relay's figure **for this model** (once it has enough samples),
+    2. this hour's figure overall (peak-hour slowness),
+    3. the recent overall figure.
 
     Speed is a variable: a figure older than BRIDGE_LATENCY_MAX_AGE is dropped
     (None -> the relay scores as "no data") and exploration re-measures it.
     """
     now = now or time.time()
     b = _stats.get(pid) or {}
+    per = b.get("lat_by_model") or {}
+    if model and model in per:
+        ent = per[model]
+        if (ent.get("lat") and ent.get("samples", 0) >= MODEL_MIN_SAMPLES
+                and now - (ent.get("ts") or 0) <= LATENCY_MAX_AGE):
+            return lat_stat(ent.get("ring"), ent["lat"])
     if not b.get("lat") or now - (b.get("lat_ts") or 0) > LATENCY_MAX_AGE:
         return None
     hour = (b.get("byhour") or {}).get(str(time.localtime(now).tm_hour))
     if hour and hour.get("samples", 0) >= HOUR_MIN_SAMPLES and hour.get("lat"):
-        return hour["lat"]
-    return b["lat"]
+        return lat_stat(hour.get("ring"), hour["lat"])
+    return lat_stat(b.get("lat_ring"), b["lat"])
 
 
 def last_measured(pid):
@@ -927,10 +993,13 @@ def parse_usage(data, days=None):
     """Turn one /v1/usage body into a price picture.
 
     per_model: all-time $ per weighted million tokens, per model
-    trend:     recent (last `days` days) price / all-time price, >1 = got
-               pricier, <1 = got cheaper - the per-model figures are scaled by
-               it so a relay that changed its price does not keep yesterday's
-               reputation
+    trend:     recent (last `days` days) $/weighted-token divided by the
+               all-time one, >1 = got pricier. **Information only**: it must
+               not be multiplied into the price. Measured against real balance
+               movement (2026-10-07) scaling by it understated pp/wdlink by
+               ~4x, because a recent cache-heavy mix lowers the recent figure
+               without the unit price having moved - the per-model all-time
+               rate matched the balance drop within ~20%.
     """
     days = PRICE_DAYS if days is None else days
     per_model = {}
@@ -968,9 +1037,8 @@ def parse_usage(data, days=None):
     trend = 1.0
     if recent and alltime and alltime > 0:
         trend = min(5.0, max(0.2, recent / alltime))
-    scaled = {m: v * trend for m, v in per_model.items()}
-    return {"per_model": scaled, "overall": (recent or alltime),
-            "alltime": alltime, "trend": trend, "days": days,
+    return {"per_model": per_model, "overall": alltime,
+            "recent": recent, "alltime": alltime, "trend": trend, "days": days,
             "daily_days": len(daily)}
 
 
@@ -1133,7 +1201,7 @@ def relay_scores(pids, routes, model, affinity_pid=None):
     prices, lats = {}, {}
     for pid in pids:
         prices[pid], _exact = price_index(pid, model)
-        lats[pid] = effective_latency(pid)
+        lats[pid] = effective_latency(pid, model)
     known_p = sorted(v for v in prices.values() if v)
     known_l = sorted(v for v in lats.values() if v)
     min_p = known_p[0] if known_p else None
@@ -1295,11 +1363,14 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
                 ordered.insert(0, start_pid)
         else:
             ordered = sorted(seed, key=lambda p: scores[p]["score"])
-        if len(ordered) > 1 and not affinity_pid:
-            # A conversation that already has its relay keeps it: warm-up and
-            # exploration are for traffic that is not mid-conversation (Codex
-            # sessions are long, and hijacking one costs its prompt cache).
-            pid, why = pick_warmup(ordered, scores), "WARMUP"
+        if len(ordered) > 1:
+            # Warm-up (measuring a relay we never tried) yields to an ongoing
+            # conversation: hijacking it costs its prompt cache. Exploration
+            # (1 in BRIDGE_EXPLORE_EVERY requests) does NOT yield - otherwise a
+            # long session would freeze the pool and stop adapting.
+            pid, why = (None, "")
+            if not affinity_pid:
+                pid, why = pick_warmup(ordered, scores), "WARMUP"
             if pid is None and explore:
                 pid, why = pick_explore(ordered, scores), "EXPLORE"
             if pid and pid != ordered[0]:
@@ -1351,6 +1422,12 @@ def log_plan(ordered, scores, model, sticky=None):
         parts.append("%s[%s %s fail%.2f p%.1f]"
                      % (pid[:8], price, lat, s["fail_rate"], s["score"]))
     log("ORDER %s -> %s" % (model or "(no model)", " > ".join(parts)))
+
+
+def routes_name(pid):
+    with _state_lock:
+        route = (_state.get("routes") or {}).get(pid) or {}
+    return route.get("name") or pid
 
 
 def status_snapshot(routes, base_order, model):
@@ -1428,6 +1505,13 @@ def save_state():
         os.replace(tmp, STATE_FILE)
     except Exception as exc:
         log("state save failed: %s" % exc)
+
+
+def normalize_state():
+    """Make every restored bucket complete (see _bucket)."""
+    with _stats_lock:
+        for pid in list(_stats):
+            _bucket(pid)
 
 
 def load_state():
@@ -1846,10 +1930,49 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(snap, ensure_ascii=False).encode("utf-8")
         self._send(200, [("Content-Type", "application/json")], body)
 
+    def _maintenance(self, method):
+        """POST /__bridge/maintenance {"reset": ["penalties"]}
+
+        Clears *false* failure signals: after a bridge-side bug made good relays
+        look broken (2026-10-07: a KeyError in the stats recorder was counted as
+        a relay failure, pushing every fail rate to 0.6-0.8 and opening
+        breakers), the scores stay poisoned long after the bug is fixed. Prices
+        and latencies are measurements and are kept; only penalties are cleared.
+        """
+        # read exactly Content-Length bytes: read_all() waits for EOF, which on
+        # a keep-alive connection never comes (that hung the first call)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if (method == "POST" and length) else b"{}"
+        try:
+            request = json.loads(body.decode("utf-8") or "{}")
+        except Exception:
+            request = {}
+        wanted = request.get("reset") or []
+        if isinstance(wanted, str):
+            wanted = [wanted]
+        changed = []
+        if "penalties" in wanted or "all" in wanted:
+            with _stats_lock:
+                for pid, b in _stats.items():
+                    b["fail"] = 0.0
+                    b["ok"] = 0.0
+                    b["fails"] = 0
+                    b["open_until"] = 0.0
+                    b["cooldown"] = BREAKER_COOLDOWN
+                    b["last_error"] = ""
+                    changed.append(routes_name(pid))
+        log("MAINT reset=%s -> cleared %d relay(s)" % (wanted, len(changed)))
+        payload = json.dumps({"reset": wanted, "cleared": changed},
+                             ensure_ascii=False).encode()
+        self._send(200, [("Content-Type", "application/json")], payload)
+
     def _handle(self, method):
         split = urlsplit(self.path)
         if split.path in ("/__bridge/status", "/__bridge/ranking"):
             self._status(split)
+            return
+        if split.path == "/__bridge/maintenance":
+            self._maintenance(method)
             return
         resolved = resolve(split.path)
         if resolved is None:
@@ -2009,7 +2132,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         # first byte is what "faster to call" really means here
                         ttfb = time.time() - attempt_started
-                        record_attempt(pid, ttfb)
+                        record_attempt(pid, ttfb, model=wanted)
                         log("OK    %s %s -> %s via %s (attempt %d/%d) model=%s"
                             % (method, split.path, status, route["name"], done,
                                attempts, wanted or "?"))
@@ -2056,7 +2179,7 @@ class Handler(BaseHTTPRequestHandler):
                     response_id = None
                     if status == 200:
                         seconds = time.time() - attempt_started
-                        record_attempt(pid, seconds)
+                        record_attempt(pid, seconds, model=wanted)
                         breaker_ok(pid)
                         try:
                             payload = json.loads(body.decode("utf-8")) or {}
@@ -2196,13 +2319,71 @@ class BridgeServer(ThreadingHTTPServer):
     request_queue_size = int(os.environ.get("BRIDGE_BACKLOG", "256"))
 
 
+def adopt_listener(fd):
+    """Rebuild the server on an inherited listening socket (see reload_in_place)."""
+    server = BridgeServer(("127.0.0.1", 0), Handler, bind_and_activate=False)
+    try:
+        server.socket.close()                       # the throwaway one
+    except Exception:
+        pass
+    server.socket = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
+    server.server_address = server.socket.getsockname()
+    server.server_bind = lambda: None
+    server.server_activate = lambda: None
+    return server
+
+
+def reload_in_place(server):
+    """SIGHUP: re-exec this file while keeping the listening socket open.
+
+    A restart is what lets CC Switch see all relays fail at once and hand Codex
+    back to the official account (that happened on 2026-10-07). Re-exec'ing with
+    the inherited fd means the port never closes, so deploys stop being an event
+    CC Switch can notice. launchd keeps tracking the same pid.
+    """
+    def handler(_signum, _frame):
+        log("SIGHUP: reloading in place (listening socket stays open)")
+        try:
+            save_state()
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            fd = server.socket.fileno()
+            os.set_inheritable(fd, True)
+            os.environ["BRIDGE_ADOPT_FD"] = str(fd)
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)]
+                     + sys.argv[1:])
+        except Exception as exc:                                   # pragma: no cover
+            log("reload failed (%r), keeping the old process" % exc)
+            os.environ.pop("BRIDGE_ADOPT_FD", None)
+    return handler
+
+
 def main():
     load_state()
+    normalize_state()          # an older state file must not break new fields
     load_routes(force=True)
     threading.Thread(target=housekeeping, daemon=True).start()
     host = os.environ.get("BRIDGE_HOST", "127.0.0.1")
     port = int(os.environ.get("BRIDGE_PORT", "15888"))
-    server = BridgeServer((host, port), Handler)
+    adopt = os.environ.get("BRIDGE_ADOPT_FD")
+    if adopt:
+        try:
+            server = adopt_listener(int(adopt))
+        except Exception as exc:
+            # a fresh bind would hit EADDRINUSE (the inherited fd is still open),
+            # so hand it back to launchd instead of serving nothing
+            log("FATAL could not adopt listening socket fd %s: %r" % (adopt, exc))
+            sys.exit(1)
+        log("reloaded in place: adopted listening socket fd %s" % adopt)
+    else:
+        server = BridgeServer((host, port), Handler)
+    signal.signal(signal.SIGHUP, reload_in_place(server))
     log("retry bridge listening on %s:%d (order=%s, attempts=%d, backlog=%d, "
         "first-byte timeout=%.0fs)"
         % (host, port, ORDER_MODE, _state["attempts"], server.request_queue_size,

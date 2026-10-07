@@ -242,10 +242,15 @@ class VariableInputsTest(unittest.TestCase):
                 {"date": "2026-10-06", "input_tokens": 1_000_000, "output_tokens": 0,
                  "cache_read_tokens": 0, "cache_write_tokens": 0, "actual_cost": 3.0}]}
         parsed = bridge_mod.parse_usage(data, days=1)
-        # all-time $1/M, yesterday $3/M -> trend 3, so it must not look cheap today
+        # all-time $1/M, yesterday $3/M -> trend 3, reported so the status page
+        # can say "this relay got pricier".
         self.assertAlmostEqual(parsed["trend"], 3.0)
-        self.assertAlmostEqual(parsed["per_model"][MODEL], 3.0)
-        self.assertAlmostEqual(parsed["overall"], 3.0)
+        self.assertAlmostEqual(parsed["recent"], 3.0)
+        # The price itself stays the all-time per-model rate: multiplying by the
+        # trend double-counted the mix and understated pp/wdlink by ~4x against
+        # real balance movement (see tests/test_scoring_v2.py).
+        self.assertAlmostEqual(parsed["per_model"][MODEL], 1.0)
+        self.assertAlmostEqual(parsed["overall"], 1.0)
 
     def test_hourly_latency_is_used_when_it_has_samples(self):
         now = time.time()
