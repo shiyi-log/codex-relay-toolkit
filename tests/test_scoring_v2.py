@@ -435,6 +435,26 @@ class SlowFirstByteTest(unittest.TestCase):
             time.time() - bridge_mod.SLOW_STREAK_TTL - 1)
         self.assertEqual(self.scores()[1]["a"]["slow_streak_decay"], 0.0)
 
+    def test_a_slow_failure_is_charged_as_slow_too(self):
+        """2026-10-07: one attempt wasted 24s before dying, the winner measured
+        10.8s - the client waited 34.8s but nothing was demoted, because only
+        successful first bytes were counted."""
+        bridge_mod.record_slow_event("a", 24.0)
+        scores = self.scores()[1]["a"]
+        self.assertGreater(scores["slow_penalty"], 0)
+        self.assertEqual(bridge_mod._stats["a"]["slow_ttfb"], 1)
+        self.assertAlmostEqual(bridge_mod._stats["a"]["slow_last"], 24.0)
+
+    def test_recording_a_slow_event_does_not_pollute_latency(self):
+        bridge_mod.record_attempt("a", 5.0, model=MODEL_A, first_byte=True)
+        before = bridge_mod._stats["a"]["lat"]
+        bridge_mod.record_slow_event("a", 24.0)
+        self.assertEqual(bridge_mod._stats["a"]["lat"], before)   # latency untouched
+
+    def test_the_waste_threshold_is_half_the_slow_threshold(self):
+        self.assertAlmostEqual(bridge_mod.SLOW_WASTE_FACTOR, 0.5)
+        self.assertAlmostEqual(bridge_mod.SLOW_TTFB * bridge_mod.SLOW_WASTE_FACTOR, 7.5)
+
     def test_a_non_streaming_total_is_not_a_first_byte(self):
         bridge_mod.record_attempt("a", 99.0, model=MODEL_A)      # no first_byte flag
         self.assertEqual(bridge_mod._stats["a"]["slow_ttfb"], 0)
@@ -460,6 +480,130 @@ class SlowFirstByteTest(unittest.TestCase):
         rows = [json.loads(l) for l in open(os.path.join(tmp, "requests.jsonl"))]
         self.assertTrue(rows[0]["slow_first_byte"])
         self.assertFalse(rows[1]["slow_first_byte"])
+
+
+class SlowFailureIntegrationTest(unittest.TestCase):
+    """A relay that fails *slowly* must end up with both a failure and a slow
+    charge, and the request must still be served by the other relay."""
+
+    def test_slow_failure_is_charged(self):
+        import http.client
+        port = free_port()
+        slow_relay = free_port()
+        fast_relay = free_port()
+        tmp = tempfile.mkdtemp(prefix="slowfail-")
+
+        class Slow(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                body = json.dumps({"data": [{"id": MODEL_A}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                time.sleep(2.0)                     # waste the client's time
+                try:
+                    self.send_response(500)         # ...then fail
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                except OSError:
+                    pass
+
+            def log_message(self, *a):
+                pass
+
+        class Fast(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                body = json.dumps({"data": [{"id": MODEL_A}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                body = (b'event: response.output_text.delta\n'
+                        b'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+                        b'event: response.completed\n'
+                        b'data: {"type":"response.completed","response":'
+                        b'{"status":"completed"}}\n\n')
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        servers = []
+        for cls, p in ((Slow, slow_relay), (Fast, fast_relay)):
+            srv = ThreadingHTTPServer(("127.0.0.1", p), cls)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            servers.append(srv)
+
+        routes_path = os.path.join(tmp, "routes.json")
+        with open(routes_path, "w") as fh:
+            json.dump({"port": port, "attempts": 3, "order": ["slow", "fast"],
+                       "routes": {
+                           "slow": {"mount": "/p/slow", "prefix": "", "name": "slow",
+                                    "upstream": "http://127.0.0.1:%d" % slow_relay,
+                                    "auth": "sk"},
+                           "fast": {"mount": "/p/fast", "prefix": "", "name": "fast",
+                                    "upstream": "http://127.0.0.1:%d" % fast_relay,
+                                    "auth": "sk"}}}, fh)
+        env = dict(os.environ, BRIDGE_ROUTES=routes_path, BRIDGE_PORT=str(port),
+                   BRIDGE_STATE=os.path.join(tmp, "state.json"),
+                   BRIDGE_LOG=os.path.join(tmp, "bridge.log"),
+                   BRIDGE_REQUEST_LOG=os.path.join(tmp, "requests.jsonl"),
+                   BRIDGE_VERBOSE="0", BRIDGE_ORDER_MODE="fixed",
+                   BRIDGE_SLOW_WASTE_FACTOR="0.1", BRIDGE_BACKOFF="0.01",
+                   BRIDGE_FIRST_BYTE_TIMEOUT="10")
+        proc = subprocess.Popen([sys.executable, BRIDGE], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    urllib.request.urlopen(
+                        "http://127.0.0.1:%d/__bridge/status" % port, timeout=1).read()
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            body = json.dumps({"model": MODEL_A, "stream": True, "input": "hi"}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/p/slow/responses" % port, data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as fh:
+                answer = fh.read()
+            self.assertIn(b"response.completed", answer)
+            snapshot = json.loads(urllib.request.urlopen(
+                "http://127.0.0.1:%d/__bridge/status" % port, timeout=5).read())
+            rows = {r["id"]: r for r in snapshot["routes"]}
+            self.assertGreaterEqual(rows["slow"]["consecutive_fails"], 1)
+            self.assertGreater(rows["slow"]["slow_rate"], 0)      # wasted time counted
+            log = open(os.path.join(tmp, "bridge.log"), errors="replace").read()
+            self.assertIn("SLOW-FAIL", log)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            for srv in servers:
+                srv.shutdown()
+                srv.server_close()
 
 
 class LegacyStateTest(unittest.TestCase):

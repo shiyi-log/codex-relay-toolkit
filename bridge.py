@@ -122,7 +122,7 @@ def log(msg):
 def log_request(mount, relay, model, attempt, status, seconds, result,
                 pid=None, tokens=None, stream_complete=None, response_id=None,
                 mount_id=None, relay_id=None, error_kind=None, breaker=None,
-                slow_first_byte=None):
+                slow_first_byte=None, client_first_byte_ms=None):
     """Append one structured request line (see BRIDGE_REQUEST_LOG).
 
     `tokens` comes from the relay's own `usage` block; `est_cost_usd` prices it
@@ -156,6 +156,8 @@ def log_request(mount, relay, model, attempt, status, seconds, result,
         entry["stream_complete"] = stream_complete
     if slow_first_byte is not None:
         entry["slow_first_byte"] = bool(slow_first_byte)
+    if client_first_byte_ms is not None:
+        entry["client_first_byte_ms"] = client_first_byte_ms
     if tokens:
         entry["tokens"] = tokens
         entry["price_per_m"] = round(price, 5) if price else None
@@ -623,6 +625,13 @@ SLOW_ALPHA = float(os.environ.get("BRIDGE_SLOW_ALPHA", "0.25"))
 W_SLOW_STREAK = float(os.environ.get("BRIDGE_W_SLOW_STREAK", "1.0"))
 SLOW_STREAK_CAP = int(os.environ.get("BRIDGE_SLOW_STREAK_CAP", "2"))
 SLOW_STREAK_TTL = float(os.environ.get("BRIDGE_SLOW_STREAK_TTL", "300"))
+# A *failed* attempt can burn the client's patience too: on 2026-10-07 a single
+# attempt wasted 24s before dying, so the client waited 34.8s while the winning
+# attempt measured only 10.8s - under the 15s threshold, so nothing was demoted
+# even though the user saw a >15s request. Any failed attempt that wasted at
+# least this share of BRIDGE_SLOW_TTFB is charged as slow *in addition* to the
+# failure, so "fails slowly" is worse than "fails fast".
+SLOW_WASTE_FACTOR = float(os.environ.get("BRIDGE_SLOW_WASTE_FACTOR", "0.5"))
 MODEL_ADAPT_PENALTY = float(os.environ.get("BRIDGE_MODEL_ADAPT_PENALTY", "0.4"))
 MODEL_MISSING_PENALTY = float(os.environ.get("BRIDGE_MODEL_MISSING_PENALTY", "1.5"))
 EWMA_ALPHA = float(os.environ.get("BRIDGE_EWMA_ALPHA", "0.3"))
@@ -978,6 +987,22 @@ def breaker_open(pid, now=None):
     now = now or time.time()
     with _stats_lock:
         return (_stats.get(pid) or {}).get("open_until", 0) > now
+
+
+def record_slow_event(pid, seconds=None):
+    """Charge one slow event without touching the latency statistics.
+
+    Used both for a slow successful first byte and for an attempt that wasted
+    the client's time before failing.
+    """
+    with _stats_lock:
+        b = _bucket(pid)
+        b["slow"] = b["slow"] * (1 - SLOW_ALPHA) + SLOW_ALPHA
+        b["slow_ttfb"] = b.get("slow_ttfb", 0) + 1
+        if seconds is not None:
+            b["slow_last"] = seconds
+        b["slow_streak"] = b.get("slow_streak", 0) + 1
+        b["slow_streak_ts"] = time.time()
 
 
 def lat_stat(ring, ewma):
@@ -2093,6 +2118,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, [("Content-Type", "application/json")], payload)
 
     def _handle(self, method):
+        request_started = time.time()          # what the *client* actually waits for
         split = urlsplit(self.path)
         if split.path in ("/__bridge/status", "/__bridge/ranking"):
             self._status(split)
@@ -2250,6 +2276,11 @@ class Handler(BaseHTTPRequestHandler):
                         netfails += 1
                         record_attempt(pid, failed=True)
                         state = breaker_charge(pid, "timeout")
+                        wasted = time.time() - attempt_started
+                        if wasted >= SLOW_TTFB * SLOW_WASTE_FACTOR:
+                            record_slow_event(pid, wasted)
+                            log("SLOW-FAIL %s wasted %.1fs before stalling (> %.1fs)"
+                                % (route["name"], wasted, SLOW_TTFB * SLOW_WASTE_FACTOR))
                         log_request(mount_name, route["name"], wanted, done, 200, None,
                                     "stalled", mount_id=start_pid, relay_id=pid,
                                     error_kind="no_content", breaker=state)
@@ -2258,7 +2289,21 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         # first byte is what "faster to call" really means here
                         ttfb = time.time() - attempt_started
+                        client_ttfb = time.time() - request_started
                         record_attempt(pid, ttfb, model=wanted, first_byte=True)
+                        if client_ttfb > SLOW_TTFB and client_ttfb > ttfb + 1.0:
+                            log("SLOW-CLIENT %s: client waited %.1fs for the first byte "
+                                "(this attempt %.1fs, the rest was earlier attempts/backoff)"
+                                % (route["name"], client_ttfb, ttfb))
+                            # The user's metric is what the *client* waited. If this
+                            # attempt is the dominant share of that wait but its own
+                            # measurement sits just under the threshold (the rest was
+                            # backoff), still charge it - a request the client felt as
+                            # 18s should not escape because we measured 13s.
+                            if ttfb <= SLOW_TTFB >= client_ttfb * 0.5:
+                                record_slow_event(pid, client_ttfb)
+                                log("SLOW-CLIENT charging %s for the client-observed wait"
+                                    % route["name"])
                         log("OK    %s %s -> %s via %s (attempt %d/%d) model=%s"
                             % (method, split.path, status, route["name"], done,
                                attempts, wanted or "?"))
@@ -2275,6 +2320,7 @@ class Handler(BaseHTTPRequestHandler):
                         log_request(mount_name, route["name"], wanted, done, status,
                                     ttfb, "ok", pid=pid, slow_first_byte=(ttfb is not None
                                                                           and ttfb > SLOW_TTFB),
+                                    client_first_byte_ms=round(client_ttfb * 1000),
                                     tokens=scanner.tokens(),
                                     stream_complete=complete,
                                     response_id=scanner.response_id,
@@ -2338,6 +2384,11 @@ class Handler(BaseHTTPRequestHandler):
                 state = "noop"
                 if kind not in ("bad_request", "model_missing"):
                     state = breaker_charge(pid, kind, retry_after, reset)
+                    wasted = time.time() - attempt_started
+                    if wasted >= SLOW_TTFB * SLOW_WASTE_FACTOR:
+                        record_slow_event(pid, wasted)
+                        log("SLOW-FAIL %s wasted %.1fs before %s (attempt %d/%d)"
+                            % (route["name"], wasted, kind, done, attempts))
                 if retry_after:
                     backoff_hint = min(RETRY_AFTER_MAX, retry_after)
                 else:
@@ -2356,6 +2407,11 @@ class Handler(BaseHTTPRequestHandler):
             except (socket.timeout, OSError) as exc:
                 record_attempt(pid, failed=True)
                 state = breaker_charge(pid, "transport")
+                wasted = time.time() - attempt_started
+                if wasted >= SLOW_TTFB * SLOW_WASTE_FACTOR:
+                    record_slow_event(pid, wasted)
+                    log("SLOW-FAIL %s wasted %.1fs before a transport error"
+                        % (route["name"], wasted))
                 log_request(mount_name, route["name"], wanted, done, None, None,
                             "network-error", mount_id=start_pid, relay_id=pid,
                             error_kind="transport", breaker=state)
