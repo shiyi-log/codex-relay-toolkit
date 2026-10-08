@@ -687,8 +687,13 @@ SLOW_WASTE_FACTOR = float(os.environ.get("BRIDGE_SLOW_WASTE_FACTOR", "0.5"))
 QUOTA_PACE = os.environ.get("BRIDGE_QUOTA_PACE", "1") != "0"
 QUOTA_TTL = float(os.environ.get("BRIDGE_QUOTA_TTL", "600"))
 QUOTA_DEADBAND = float(os.environ.get("BRIDGE_QUOTA_DEADBAND", "5"))       # % points
-QUOTA_CATCHUP_SHARE = float(os.environ.get("BRIDGE_QUOTA_CATCHUP_SHARE", "0.25"))
-QUOTA_CATCHUP_MAX = float(os.environ.get("BRIDGE_QUOTA_CATCHUP_MAX", "0.5"))
+QUOTA_CATCHUP_SHARE = float(os.environ.get("BRIDGE_QUOTA_CATCHUP_SHARE", "0.35"))
+QUOTA_CATCHUP_MAX = float(os.environ.get("BRIDGE_QUOTA_CATCHUP_MAX", "1.0"))
+# Promotions may interrupt an ongoing conversation (that is what makes the share
+# meaningful - otherwise long threads pin every request to a relay and the
+# allowance is never consumed). If the account then rejects such a request, the
+# conversation is remembered and never promoted again for this long.
+QUOTA_UNSAFE_TTL = float(os.environ.get("BRIDGE_QUOTA_UNSAFE_TTL", "21600"))
 QUOTA_FINAL_DAYS = float(os.environ.get("BRIDGE_QUOTA_FINAL_DAYS", "1.0"))
 QUOTA_FINAL_MIN = float(os.environ.get("BRIDGE_QUOTA_FINAL_MIN", "20"))    # % points
 QUOTA_EXPIRES = 0.0
@@ -830,7 +835,8 @@ TOKEN_WEIGHTS = {"input_tokens": 1.0, "output_tokens": 4.0,
 _stats_lock = threading.Lock()
 _stats = {}       # pid -> {"lat", "ok", "fail", "samples", "ts", "lat_ts", "byhour"}
 _prices = {}      # pid -> {"ts", "per_model", "overall", "trend", "error"}
-_pace = {"n": 0}      # request counter used to spread catch-up promotions
+_pace = {"acc": 0.0}      # request counter used to spread catch-up promotions
+_acct_unsafe = {}     # conversation key -> ts: the account rejected this thread
 _last_plan = {"order": [], "signature": ""}
 _explore = {"n": 0}
 _affinity = {}     # conversation key -> (pid, last seen)   [session stickiness]
@@ -1636,7 +1642,7 @@ def pick_warmup(pids, scores):
 
 
 def plan_order(routes, base_order, start_pid, model, remember=True, explore=False,
-               affinity_pid=None, scope=None):
+               affinity_pid=None, scope=None, conv_key=None):
     """The attempt order for one request.
 
     adaptive (default): cheapest + fastest first, subscription account last,
@@ -1713,24 +1719,33 @@ def plan_order(routes, base_order, start_pid, model, remember=True, explore=Fals
         ordered = [affinity_oauth] + ordered
         oauth = []
         quota_note = "affinity-account"
-    elif oauth and QUOTA_PACE and ORDER_MODE != "fixed" and remember and not affinity_pid:
+    elif oauth and QUOTA_PACE and ORDER_MODE != "fixed" and remember:
         acct = oauth[0]
         pace = quota_pace(acct)
+        unsafe = (_acct_unsafe.get(conv_key or "")
+                  and time.time() - _acct_unsafe.get(conv_key or "", 0) < QUOTA_UNSAFE_TTL)
         if pace["state"] == "ahead" and not breaker_open(acct):
-            # spending faster than the window allows: keep the rest for later days
-            oauth = []
-            quota_note = "ahead"
-            log("QUOTA ahead: %s - 不兜底，留给后面的天数（%s）"
-                % (routes_name(acct), pace["reason"]))
-        elif pace["state"] == "behind" and pace["share"] > 0 and not breaker_open(acct):
-            every = 1 if pace["share"] >= 1 else max(2, int(round(1.0 / pace["share"])))
-            _pace["n"] += 1
-            if every == 1 or _pace["n"] % every == 0:
-                ordered = [acct] + ordered          # prepaid and perishable: use it
+            if affinity_pid is None and not unsafe:
+                oauth = []
+                quota_note = "ahead"
+                log("QUOTA ahead: %s - 不兜底，留给后面的天数（%s）"
+                    % (routes_name(acct), pace["reason"]))
+        elif (pace["state"] == "behind" and pace["share"] > 0 and not breaker_open(acct)
+              and not unsafe):
+            # fractional accumulator: a share of 0.743 must mean 74% of requests,
+            # not the 50% that rounding to "1 in 2" produced
+            _pace["acc"] += pace["share"]
+            if _pace["acc"] >= 1.0:
+                _pace["acc"] -= 1.0
+                # Prepaid and perishable: use it - even mid-conversation. Once it
+                # serves a turn, affinity keeps the thread on the account, so a
+                # thread moves at most once.
+                ordered = [acct] + ordered
                 oauth = []
                 quota_note = "behind"
-                log("QUOTA behind: %s - 这次主动用账号（%s，约每 %d 个请求 1 次）"
-                    % (routes_name(acct), pace["reason"], every))
+                log("QUOTA behind: %s - 这次主动用账号（%s，目标份额 %.0f%%%s）"
+                    % (routes_name(acct), pace["reason"], 100 * pace["share"],
+                       "，会话中途切换" if affinity_pid else ""))
     wants_pref = bool(scope and (preferred_pids(scope, routes)
                                  or (scope == "images" and start_pid)))
     if scope and len(ordered) > 1 and (wants_pref
@@ -2575,7 +2590,8 @@ class Handler(BaseHTTPRequestHandler):
             _prices_ready.wait(PRICE_WAIT)
         sticky = affinity_get(conv_key)
         ordered, scores = plan_order(routes, base_order, start_pid, wanted,
-                                     explore=explore, affinity_pid=sticky, scope=scope)
+                                     explore=explore, affinity_pid=sticky, scope=scope,
+                                     conv_key=conv_key)
         log_plan(ordered, scores, wanted, sticky=sticky)
         if sticky and ordered and ordered[0] != sticky:
             log("AFFINITY %s: leaving %s for %s"
@@ -2796,6 +2812,11 @@ class Handler(BaseHTTPRequestHandler):
                     state = breaker_charge(pid, kind, retry_after, reset)
                     unsupported_pids.add(pid)
                     note_capability(pid, scope, False)
+                    if route.get("auth_type") == "oauth" and kind == "bad_request" \
+                            and conv_key:
+                        _acct_unsafe[conv_key] = time.time()
+                        log("QUOTA unsafe: 账号不接受这个会话（%s），以后不再把它推给账号"
+                            % routes_name(pid))
                     log("UNSUPPORTED %s (attempt %d/%d) model=%s - short park %.0fs"
                         % (route["name"], done, attempts, wanted or "?",
                            UNSUPPORTED_COOLDOWN))

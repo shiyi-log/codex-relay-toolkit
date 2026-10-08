@@ -37,7 +37,7 @@ def quota_snapshot(**kw):
 class PaceTest(unittest.TestCase):
     def setUp(self):
         bridge_mod._stats.clear()
-        bridge_mod._pace["n"] = 0
+        bridge_mod._pace["acc"] = 0.0
 
     def pace(self, now=None, **kw):
         bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(**kw)
@@ -114,7 +114,7 @@ class PlanIntegrationTest(unittest.TestCase):
     def setUp(self):
         bridge_mod._stats.clear()
         bridge_mod._prices.clear()
-        bridge_mod._pace["n"] = 0
+        bridge_mod._pace["acc"] = 0.0
         bridge_mod._last_plan["order"] = []
         bridge_mod._last_plan["signature"] = ""
         self.routes = {
@@ -150,25 +150,72 @@ class PlanIntegrationTest(unittest.TestCase):
         self.assertNotIn(ACCT, rows)
         self.assertEqual(rows, ["relay"])
 
-    def test_promotions_are_spread_over_requests(self):
-        bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
-        orders = self.order(6)
-        promoted = sum(1 for rows in orders if rows[0] == ACCT)
-        self.assertGreater(promoted, 0)
-        self.assertLess(promoted, len(orders))            # not every request
+    def _order_with_share(self, share, count=20):
+        """Drive plan_order with a fixed share (decoupled from the pace formula)."""
+        real = bridge_mod.quota_pace
+        bridge_mod.quota_pace = lambda pid, now=None: {
+            "state": "behind", "share": share, "used_percent": 0.0,
+            "target_percent": 50.0, "days_left": 3.0, "remaining_percent": 100.0,
+            "reason": "test", "plan": "prolite", "reset_in_s": 100, "window_s": WINDOW}
+        try:
+            bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
+            return self.order(count)
+        finally:
+            bridge_mod.quota_pace = real
 
-    def test_pacing_does_not_hijack_a_pinned_conversation(self):
-        """Moving a live conversation between the account and a relay makes the
-        backend reject its item ids, so pacing must leave pinned threads alone."""
-        bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
-        rows, _ = bridge_mod.plan_order(self.routes, ["relay", ACCT], None,
-                                        "gpt-6.1-sol", remember=True,
-                                        affinity_pid="relay")
+    def test_promotions_hit_the_configured_share(self):
+        orders = self._order_with_share(0.5)
+        promoted = sum(1 for rows in orders if rows[0] == ACCT)
+        self.assertAlmostEqual(promoted / len(orders), 0.5, delta=0.1)
+
+    def test_a_fractional_share_is_not_rounded_away(self):
+        """A share of 0.75 must promote 75% of requests - the old integer
+        rounding turned it into "1 in 2" (50%)."""
+        orders = self._order_with_share(0.75)
+        promoted = sum(1 for rows in orders if rows[0] == ACCT)
+        self.assertAlmostEqual(promoted / len(orders), 0.75, delta=0.1)
+
+
+    def test_behind_pacing_may_move_a_pinned_conversation(self):
+        """Long threads pin every request to a relay, which is why the allowance
+        went unused (17.6% of traffic over 10h while 10 points behind). When the
+        pace is behind, a promotion may interrupt; afterwards affinity keeps the
+        thread on the account, so a thread moves at most once."""
+        old_share = bridge_mod.QUOTA_CATCHUP_SHARE
+        bridge_mod.QUOTA_CATCHUP_SHARE = 1.0      # promote every request
+        try:
+            bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
+            rows, _ = bridge_mod.plan_order(self.routes, ["relay", ACCT], None,
+                                            "gpt-6.1-sol", remember=True,
+                                            affinity_pid="relay")
+        finally:
+            bridge_mod.QUOTA_CATCHUP_SHARE = old_share
+        self.assertEqual(rows[0], ACCT)
+
+    def test_a_conversation_the_account_rejected_is_never_promoted_again(self):
+        old_key = bridge_mod._pace.get("unsafe_key")
+        bridge_mod._acct_unsafe["conv-1"] = time.time()
+        try:
+            bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
+            old_share = bridge_mod.QUOTA_CATCHUP_SHARE
+            bridge_mod.QUOTA_CATCHUP_SHARE = 1.0
+            try:
+                rows, _ = bridge_mod.plan_order(self.routes, ["relay", ACCT], None,
+                                                "gpt-6.1-sol", remember=True,
+                                                affinity_pid="relay",
+                                                conv_key="conv-1")
+            finally:
+                bridge_mod.QUOTA_CATCHUP_SHARE = old_share
+        finally:
+            bridge_mod._acct_unsafe.pop("conv-1", None)
         self.assertEqual(rows[0], "relay")
+
+    def test_an_account_pinned_conversation_stays_on_the_account(self):
+        bridge_mod._bucket(ACCT)["quota"] = quota_snapshot(used_percent=0.0)
         rows, _ = bridge_mod.plan_order(self.routes, ["relay", ACCT], None,
                                         "gpt-6.1-sol", remember=True,
                                         affinity_pid=ACCT)
-        self.assertEqual(rows[0], ACCT)           # stays where its state lives
+        self.assertEqual(rows[0], ACCT)
 
     def test_pacing_can_be_switched_off(self):
         old = bridge_mod.QUOTA_PACE
