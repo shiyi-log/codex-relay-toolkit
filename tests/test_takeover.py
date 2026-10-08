@@ -22,6 +22,66 @@ OFFICIAL_URL = ('model_provider = "cc-switch-official"\n[model_providers.cc-swit
                 'base_url = "http://127.0.0.1:15721/v1"\n')
 
 
+class ClientModeTest(unittest.TestCase):
+    """CC Switch 4.0.x exposes direct / proxy / stack modes in live-state.json;
+    only `proxy` puts the bridge in the path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="livestate-")
+        self.saved = (tk.LIVE_STATE, tk.CODEX_CONFIG, tk.log)
+        tk.LIVE_STATE = os.path.join(self.tmp, "live-state.json")
+        tk.CODEX_CONFIG = os.path.join(self.tmp, "config.toml")
+        tk.log = lambda *a, **k: None
+        with open(tk.CODEX_CONFIG, "w") as fh:
+            fh.write('base_url = "http://127.0.0.1:15721/v1"\n')
+
+    def tearDown(self):
+        (tk.LIVE_STATE, tk.CODEX_CONFIG, tk.log) = self.saved
+
+    def write_state(self, mode, attached=True, members=("a", "b")):
+        with open(tk.LIVE_STATE, "w") as fh:
+            json.dump({"version": 1, "apps": {"codex": {
+                "mode": mode, "attached": attached, "proxy_route": "abc",
+                "stack": {"members": list(members), "keys": {}}}}}, fh)
+
+    def test_proxy_mode_is_attached(self):
+        self.write_state("proxy")
+        self.assertTrue(tk.takeover_active())
+        self.assertEqual(tk.client_state()[0], "proxy")
+        self.assertEqual(tk.client_state()[3], 2)          # stack members counted
+
+    def test_stack_mode_bypasses_the_bridge(self):
+        self.write_state("stack")
+        self.assertFalse(tk.takeover_active())
+
+    def test_direct_mode_bypasses_the_bridge(self):
+        self.write_state("direct")
+        self.assertFalse(tk.takeover_active())
+
+    def test_proxy_mode_without_attachment_is_not_active(self):
+        self.write_state("proxy", attached=False)
+        self.assertFalse(tk.takeover_active())
+
+    def test_missing_live_state_falls_back_to_the_base_url(self):
+        tk.LIVE_STATE = os.path.join(self.tmp, "nope.json")
+        self.assertTrue(tk.takeover_active())
+
+    def test_fix_refuses_to_touch_a_non_proxy_mode(self):
+        self.write_state("stack")
+        tk.bridge_status = lambda: (True, [{"id": "a", "name": "A"}])
+        tk.providers = lambda: {"a": {"name": "A", "config": BRIDGED}}
+        restarted = []
+        tk.restart_app = lambda: restarted.append(1)
+        self.assertEqual(tk.fix(self.args()), 1)
+        self.assertEqual(restarted, [])                     # never restart the app
+
+    def args(self):
+        class A:
+            quiet = False
+            no_restart = False
+        return A()
+
+
 class DecisionTest(unittest.TestCase):
     def test_is_bridged(self):
         self.assertTrue(tk.is_bridged(BRIDGED))

@@ -40,6 +40,11 @@ DB = os.environ.get("BRIDGE_DB", os.path.expanduser("~/.cc-switch/cc-switch.db")
 CODEX_CONFIG = os.environ.get("CODEX_CONFIG", os.path.expanduser("~/.codex/config.toml"))
 CC_LOG = os.environ.get("CCSWITCH_LOG", os.path.expanduser("~/.cc-switch/logs/cc-switch.log"))
 DISABLED = os.path.join(BASE, "TAKEOVER.DISABLED")
+# CC Switch 4.0.x keeps the authoritative mode here: apps.<app>.mode is one of
+# direct / proxy / stack (直连 / 路由 / 聚合), plus `attached` and `proxy_route`.
+LIVE_STATE = os.environ.get("CCSWITCH_LIVE_STATE",
+                            os.path.expanduser("~/.cc-switch/live-state.json"))
+MODE_LABEL = {"direct": "直连", "proxy": "路由", "stack": "聚合"}
 LOG = os.path.join(BASE, "takeover.log")
 APP = os.environ.get("CCSWITCH_APP", "CC Switch")
 GRACE = float(os.environ.get("BRIDGE_TAKEOVER_GRACE", "15"))
@@ -178,8 +183,26 @@ def restart_app():
     subprocess.run(["open", "-a", "/Applications/%s.app" % APP], capture_output=True)
 
 
+def client_state(app="codex"):
+    """-> (mode, attached, proxy_route, stack_members) from live-state.json."""
+    try:
+        with open(LIVE_STATE) as fh:
+            state = json.load(fh)
+    except Exception:
+        return None, None, None, None
+    entry = ((state.get("apps") or {}).get(app) or {})
+    stack = entry.get("stack") or {}
+    return (entry.get("mode"), entry.get("attached"), entry.get("proxy_route"),
+            len(stack.get("members") or []))
+
+
 def takeover_active():
-    """Did CC Switch re-take-over the client config, i.e. is Codex on the proxy?"""
+    """Is Codex actually being served through the proxy (and hence the bridge)?"""
+    mode, attached, _route, _members = client_state()
+    if mode is not None:
+        # live-state.json is authoritative: 聚合/直连 means the bridge is bypassed
+        if mode != "proxy" or attached is False:
+            return False
     base = codex_base_url() or ""
     return "127.0.0.1:%d" % 15721 in base or ("127.0.0.1:%d/p/" % BRIDGE_PORT) in base
 
@@ -199,6 +222,12 @@ def fix(args):
     if not healthy:
         log("桥不可用，先不动（等桥恢复）")
         return 0
+    mode, attached, _route, _members = client_state()
+    if mode in ("stack", "direct"):
+        log("CC Switch 现在是 %s 模式（不是路由模式）：桥不在链路上。"
+            "请先在 CC Switch 界面切回「路由」，本工具不会去改模式。"
+            % MODE_LABEL.get(mode, mode))
+        return 1
     if bridged_now and takeover_active():
         if not args.quiet:
             log("已经在走桥，无需处理")
@@ -237,6 +266,7 @@ def fix(args):
 
 def status(args):
     healthy, routes = bridge_status()
+    mode, attached, route, members = client_state()
     provs = providers()
     pid = current_provider()
     entry = provs.get(pid or "", {})
@@ -244,6 +274,16 @@ def status(args):
     print("CC Switch 当前 : %s（%s）" % (entry.get("name") or pid, pid))
     print("  指向桥        : %s" % ("是" if is_bridged(entry.get("config")) else "否"))
     print("Codex base_url : %s" % codex_base_url())
+    if mode is not None:
+        print("CC Switch 模式 : %s（%s）%s"
+              % (MODE_LABEL.get(mode, mode), mode,
+                 "，已接管" if attached else "，未接管"))
+        if route:
+            print("  路由到       : %s" % route)
+        if mode == "stack":
+            print("  ⚠ 聚合模式：不走故障转移，官方账号也不能加入 → 桥被绕开")
+        elif mode == "direct":
+            print("  ⚠ 直连模式：完全绕过本地代理")
     print("代理接管中     : %s" % ("是" if takeover_active() else "否 ← 流量没走桥"))
     if os.path.exists(DISABLED):
         print("TAKEOVER.DISABLED: 存在（--fix 不会动作）")
